@@ -373,6 +373,7 @@ impl App {
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
         let (env, _) = self.custom_command_env();
+        let token = self.state.allocate_pane_token()?;
 
         let ws = self
             .state
@@ -392,6 +393,7 @@ impl App {
             )
         });
         let new_pane = ws.split_focused_command(
+            token,
             Direction::Horizontal,
             new_rows,
             new_cols,
@@ -448,6 +450,7 @@ impl App {
             return Err(std::io::Error::other("no active workspace"));
         };
         let previous_focus_target = self.state.current_pane_focus_target();
+        let token = self.state.allocate_pane_token()?;
         let (rows, cols) = self.state.estimate_pane_size();
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
@@ -479,6 +482,7 @@ impl App {
             let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
             let result = ws.split_pane_argv_command(
                 previous_focus,
+                token,
                 Direction::Horizontal,
                 new_rows,
                 new_cols,

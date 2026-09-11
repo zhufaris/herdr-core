@@ -25,6 +25,19 @@ pub(crate) struct PopupPaneState {
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
 use crate::workspace::Workspace;
 
+pub(crate) fn initial_pane_token_candidate() -> u32 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    (hasher.finish() % u64::from(crate::pane::PANE_TOKEN_SPACE)) as u32
+}
+
 // ---------------------------------------------------------------------------
 // Theme palette — all UI colors in one place, ready for theming
 // ---------------------------------------------------------------------------
@@ -794,6 +807,9 @@ pub struct AppState {
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
+    /// Next candidate in the four-character pane-token space. Allocation
+    /// checks all live panes, so this cursor is only a starting point.
+    pub(crate) next_pane_token_candidate: u32,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
@@ -892,6 +908,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn allocate_pane_token(&mut self) -> std::io::Result<crate::pane::PaneToken> {
+        let used: std::collections::HashSet<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .map(|pane| pane.token)
+            .collect();
+        if used.len() >= crate::pane::PANE_TOKEN_SPACE as usize {
+            return Err(std::io::Error::other("pane token space exhausted"));
+        }
+
+        for _ in 0..crate::pane::PANE_TOKEN_SPACE {
+            let candidate = crate::pane::PaneToken::from_index(self.next_pane_token_candidate);
+            self.next_pane_token_candidate =
+                (self.next_pane_token_candidate + 1) % crate::pane::PANE_TOKEN_SPACE;
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(std::io::Error::other("pane token space exhausted"))
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -1025,6 +1064,7 @@ impl AppState {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
+            next_pane_token_candidate: 0,
             active: None,
             previous_pane_focus: None,
             selected: 0,
@@ -1197,6 +1237,7 @@ impl AppState {
         let mut workspace_id_to_idx = std::collections::HashMap::new();
         let mut pane_ids = std::collections::HashSet::new();
         let mut attached_terminal_ids = std::collections::HashSet::new();
+        let mut pane_tokens = std::collections::HashSet::new();
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             assert!(
                 workspace_ids.insert(ws.id.clone()),
@@ -1213,6 +1254,11 @@ impl AppState {
                         pane_ids.insert(*pane_id),
                         "pane {:?} appears in more than one workspace",
                         pane_id
+                    );
+                    assert!(
+                        pane_tokens.insert(pane.token),
+                        "pane token {} appears more than once in the session",
+                        pane.token
                     );
                     assert!(
                         attached_terminal_ids.insert(pane.attached_terminal_id.clone()),
@@ -1317,6 +1363,23 @@ mod tests {
         state.headless_size = (132, 41);
 
         assert_eq!(state.estimate_pane_size(), (41, 132));
+    }
+
+    #[test]
+    fn pane_token_allocation_skips_tokens_used_anywhere_in_session() {
+        let mut state = AppState::test_new();
+        let mut first = crate::workspace::Workspace::test_new("first");
+        let mut second = crate::workspace::Workspace::test_new("second");
+        let first_pane = first.tabs[0].root_pane;
+        first.tabs[0].panes.get_mut(&first_pane).unwrap().token =
+            crate::pane::PaneToken::parse("0000").unwrap();
+        let second_pane = second.tabs[0].root_pane;
+        second.tabs[0].panes.get_mut(&second_pane).unwrap().token =
+            crate::pane::PaneToken::parse("zzzz").unwrap();
+        state.workspaces = vec![first, second];
+        state.next_pane_token_candidate = 0;
+
+        assert_eq!(state.allocate_pane_token().unwrap().as_str(), "0001");
     }
 
     #[test]

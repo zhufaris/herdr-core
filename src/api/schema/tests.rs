@@ -63,6 +63,29 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn pane_info_token_is_optional_and_uses_canonical_shape() {
+    let mut value = serde_json::json!({
+        "pane_id": "w1:p1",
+        "terminal_id": "term_1",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    });
+    let legacy: PaneInfo = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.token, None);
+    assert!(serde_json::to_value(&legacy)
+        .unwrap()
+        .get("token")
+        .is_none());
+
+    value["token"] = serde_json::json!("ab12");
+    let current: PaneInfo = serde_json::from_value(value).unwrap();
+    assert_eq!(current.token.as_deref(), Some("ab12"));
+}
+
+#[test]
 fn workspace_close_group_intent_defaults_false_and_round_trips() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "id": "close",
@@ -820,6 +843,7 @@ fn worktree_request_and_response_round_trip() {
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-1".into(),
+                token: None,
                 terminal_id: "term_1".into(),
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:1".into(),
@@ -1248,6 +1272,7 @@ fn create_response_round_trips_with_root_pane() {
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-3".into(),
+                token: None,
                 terminal_id: "term_example".into(),
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:2".into(),

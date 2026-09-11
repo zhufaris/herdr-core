@@ -62,6 +62,10 @@ impl App {
         let host_terminal_theme = self.state.host_terminal_theme;
         let host_terminal_appearance = self.state.host_terminal_appearance;
         let previous_focus = self.state.current_pane_focus_target();
+        let token = match self.state.allocate_pane_token() {
+            Ok(token) => token,
+            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        };
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
@@ -73,6 +77,7 @@ impl App {
         let split_result = match params.ratio {
             Some(ratio) => ws.split_pane_with_ratio(
                 target_pane_id,
+                token,
                 direction,
                 ratio,
                 rows,
@@ -87,6 +92,7 @@ impl App {
             ),
             None => ws.split_pane(
                 target_pane_id,
+                token,
                 direction,
                 rows,
                 cols,
@@ -2369,6 +2375,14 @@ mod tests {
         let ResponseResult::PaneInfo { pane } = success.result else {
             panic!("expected pane info response");
         };
+        assert_eq!(
+            pane.token.as_deref(),
+            Some(
+                app.state.workspaces[0].tabs[0].panes[&pane_id]
+                    .token
+                    .as_str()
+            )
+        );
         let scroll = pane.scroll.expect("scroll metrics");
         assert_eq!(scroll.offset_from_bottom, 3);
         assert!(scroll.max_offset_from_bottom >= scroll.offset_from_bottom);

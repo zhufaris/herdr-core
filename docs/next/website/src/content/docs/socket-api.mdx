@@ -154,7 +154,11 @@ like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 
 `pane.current` returns a single `PaneInfo`. When `caller_pane_id` is present,
 Herdr returns that pane. When it is omitted, Herdr returns the active focused
-pane.
+pane. Each live `PaneInfo` also includes `token`, a session-wide unique,
+four-character lowercase base36 locator such as `ab12`. The token is preserved
+when a pane moves and across session restore, but it is not a security
+credential or a replacement for the stable `pane_id`. Existing pane-target
+parameters continue to accept `pane_id`, not `token`.
 
 `pane.input.set` sets `right_click` to `herdr` or `pane` for one pane. `herdr`
 is the default. `pane` forwards unmodified right-click hold and drag gestures
@@ -775,7 +779,15 @@ Use `pane.report_metadata` when a user hook wants to customize presentation with
 
 Metadata reports are display-only. Valid metadata can override the pane title, displayed agent name, visible state labels, and arbitrary named tokens. `working`, `blocked`, `idle`, waits, notifications, and rollups still come from semantic state. Native session restore comes from stored official session references. `agent` is an optional guard for presentation fields against the authoritative agent label; `applies_to_source` similarly guards presentation fields against the active lifecycle authority source. These guards do not apply to token patches: token reporters own clearing and TTL refresh. Use `display_agent` to change the visible name. `state_labels` keys must be `idle`, `working`, `blocked`, `done`, or `unknown`.
 
-Token maps are per-resource patches. A string sets a key, JSON `null` clears it, and omitted keys remain unchanged. The latest accepted update wins. Optional TTL applies independently to token keys updated by that report. Pane tokens are exposed by pane and agent get/list responses and can be rendered as `$name` in Agent sidebar rows. A report may mention at most 16 token keys, and a pane or workspace may retain at most 32 keys. Token names are 1–32 ASCII letters, digits, underscores, or hyphens.
+The `tokens` map is metadata and is separate from the native singular
+`PaneInfo.token` locator described above. Metadata token maps are per-resource
+patches. A string sets a key, JSON `null` clears it, and omitted keys remain
+unchanged. The latest accepted update wins. Optional TTL applies independently
+to token keys updated by that report. Metadata pane tokens are exposed by pane
+and agent get/list responses and can be rendered as `$name` in Agent sidebar
+rows. A report may mention at most 16 token keys, and a pane or workspace may
+retain at most 32 keys. Token names are 1–32 ASCII letters, digits, underscores,
+or hyphens.
 
 Workspace tokens use the same contract:
 

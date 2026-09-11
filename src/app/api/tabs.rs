@@ -74,6 +74,10 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        let token = match self.state.allocate_pane_token() {
+            Ok(token) => token,
+            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        };
         let result = self
             .state
             .workspaces
@@ -81,6 +85,7 @@ impl App {
             .ok_or_else(|| std::io::Error::other("workspace disappeared"))
             .and_then(|ws| {
                 ws.create_tab(
+                    token,
                     rows,
                     cols,
                     cwd,

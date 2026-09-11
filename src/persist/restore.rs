@@ -9,7 +9,7 @@ use tracing::{error, warn};
 use crate::detect::AgentState;
 use crate::events::AppEvent;
 use crate::layout::{Node, PaneId, TileLayout};
-use crate::pane::{PaneLaunchEnv, PaneState};
+use crate::pane::{PaneLaunchEnv, PaneState, PaneToken, PANE_TOKEN_SPACE};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 use crate::workspace::Workspace;
@@ -60,6 +60,120 @@ type RestoredTab = (
     HashMap<PaneId, u32>,
 );
 type RestoreFailures<T> = (T, usize);
+
+fn restored_pane_tokens(snapshot: &SessionSnapshot) -> HashMap<(usize, usize, u32), PaneToken> {
+    let mut tokens = HashMap::new();
+    let mut used = HashSet::new();
+    let mut missing = Vec::new();
+
+    for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
+        for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+            let mut pane_ids = Vec::new();
+            collect_layout_snapshot_pane_ids(&tab.layout, &mut pane_ids);
+            for old_pane_id in pane_ids {
+                let key = (workspace_index, tab_index, old_pane_id);
+                let saved = tab
+                    .panes
+                    .get(&old_pane_id)
+                    .and_then(|pane| pane.token.as_deref())
+                    .and_then(PaneToken::parse);
+                if let Some(token) = saved.filter(|token| used.insert(*token)) {
+                    tokens.insert(key, token);
+                } else {
+                    missing.push(key);
+                }
+            }
+        }
+    }
+
+    for key in missing {
+        let mut candidate_index = deterministic_token_start(key);
+        for _ in 0..PANE_TOKEN_SPACE {
+            let token = PaneToken::from_index(candidate_index);
+            if used.insert(token) {
+                tokens.insert(key, token);
+                break;
+            }
+            candidate_index = (candidate_index + 1) % PANE_TOKEN_SPACE;
+        }
+    }
+    tokens
+}
+
+fn deterministic_token_start((workspace, tab, pane): (usize, usize, u32)) -> u32 {
+    let mut value = u64::from(pane);
+    value ^= (workspace as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value = value.rotate_left(17) ^ (tab as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (value % u64::from(PANE_TOKEN_SPACE)) as u32
+}
+
+#[cfg(test)]
+mod pane_token_tests {
+    use super::*;
+    use crate::persist::snapshot::{PaneSnapshot, SessionSnapshot, TabSnapshot, WorkspaceSnapshot};
+
+    fn pane(cwd: &std::path::Path, token: Option<&str>) -> PaneSnapshot {
+        PaneSnapshot {
+            cwd: cwd.to_path_buf(),
+            token: token.map(str::to_string),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: None,
+        }
+    }
+
+    #[test]
+    fn restore_preserves_valid_tokens_and_repairs_missing_invalid_and_duplicate_values() {
+        let cwd = std::path::PathBuf::from("/tmp");
+        let tab = |first: u32, second: u32, first_token, second_token| TabSnapshot {
+            custom_name: None,
+            layout: LayoutSnapshot::Split {
+                direction: super::DirectionSnapshot::Horizontal,
+                ratio: 0.5,
+                first: Box::new(LayoutSnapshot::Pane(first)),
+                second: Box::new(LayoutSnapshot::Pane(second)),
+            },
+            panes: HashMap::from([
+                (first, pane(&cwd, first_token)),
+                (second, pane(&cwd, second_token)),
+            ]),
+            zoomed: false,
+            focused: Some(first),
+            root_pane: Some(first),
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
+                public_tab_numbers: vec![1, 2],
+                next_public_tab_number: 3,
+                tabs: vec![
+                    tab(10, 11, Some("ab12"), Some("AB12")),
+                    tab(12, 13, Some("ab12"), None),
+                ],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: HashSet::new(),
+        };
+
+        let repaired = restored_pane_tokens(&snapshot);
+        assert_eq!(repaired[&(0, 0, 10)].as_str(), "ab12");
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(repaired.values().copied().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(repaired, restored_pane_tokens(&snapshot));
+    }
+}
 
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
 pub fn restore(
@@ -267,6 +381,7 @@ fn restore_with_imports_and_failures(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
+    let pane_tokens = restored_pane_tokens(snapshot);
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
@@ -282,6 +397,7 @@ fn restore_with_imports_and_failures(
             render_dirty: render_dirty.clone(),
         };
         let (restored, workspace_failed_imports) = restore_workspace(
+            idx,
             ws_snap,
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
@@ -289,6 +405,7 @@ fn restore_with_imports_and_failures(
             &runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
+            &pane_tokens,
         );
         failed_imports += workspace_failed_imports;
         if let Some((workspace, restored_terminals, restored_runtimes)) = restored {
@@ -304,6 +421,7 @@ fn restore_with_imports_and_failures(
 }
 
 fn restore_workspace(
+    workspace_index: usize,
     snap: &WorkspaceSnapshot,
     history: Option<&WorkspaceHistorySnapshot>,
     rows: u16,
@@ -311,6 +429,7 @@ fn restore_workspace(
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    pane_tokens: &HashMap<(usize, usize, u32), PaneToken>,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
@@ -356,6 +475,8 @@ fn restore_workspace(
     for (idx, tab_snap) in snap.tabs.iter().enumerate() {
         let tab_number = snap.public_tab_numbers.get(idx).copied().unwrap_or(idx + 1);
         let (restored_tab, tab_failed_imports) = restore_tab(
+            workspace_index,
+            idx,
             tab_snap,
             history.and_then(|history| history.tabs.get(idx)),
             tab_number,
@@ -366,6 +487,7 @@ fn restore_workspace(
             resumed_agent_sessions,
             imported_panes,
             &public_pane_ids_by_old_raw,
+            pane_tokens,
         );
         failed_imports += tab_failed_imports;
         let Some((mut tab, restored_terminals, restored_runtimes, reverse_id_map)) = restored_tab
@@ -443,7 +565,11 @@ fn restored_worktree_space_membership(
     })
 }
 
+// Restore threads persisted identity, process startup, and runtime ownership in one pass.
+#[allow(clippy::too_many_arguments)]
 fn restore_tab(
+    workspace_index: usize,
+    tab_index: usize,
     snap: &TabSnapshot,
     history: Option<&TabHistorySnapshot>,
     number: usize,
@@ -454,6 +580,7 @@ fn restore_tab(
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
+    pane_tokens: &HashMap<(usize, usize, u32), PaneToken>,
 ) -> RestoreFailures<Option<RestoredTab>> {
     let (node, id_map) = restore_node_remapped(&snap.layout);
     let reverse_id_map: HashMap<PaneId, u32> = id_map
@@ -468,6 +595,10 @@ fn restore_tab(
     let mut failed_imports = 0;
     for id in &pane_ids {
         let old_id = reverse_id_map.get(id);
+        let token = old_id
+            .and_then(|old_id| pane_tokens.get(&(workspace_index, tab_index, *old_id)))
+            .copied()
+            .expect("every restored pane must have a repaired token");
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
@@ -561,7 +692,7 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            panes.insert(*id, PaneState::new(terminal_id));
+            panes.insert(*id, PaneState::new(terminal_id, token));
             terminals.push(terminal);
             continue;
         }
@@ -660,7 +791,7 @@ fn restore_tab(
                         std::time::Instant::now(),
                     );
                 }
-                panes.insert(*id, PaneState::new(terminal_id.clone()));
+                panes.insert(*id, PaneState::new(terminal_id.clone(), token));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }
@@ -1188,6 +1319,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            token: None,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
                             managed_agent_kind: Some("opencode".into()),
@@ -1274,6 +1406,7 @@ mod tests {
                             10,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                token: None,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -1285,6 +1418,7 @@ mod tests {
                             20,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                token: None,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -1338,6 +1472,7 @@ mod tests {
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
                     cwd: cwd.clone(),
+                    token: None,
                     label: None,
                     agent_name: None,
                     managed_agent_kind: None,
@@ -1348,6 +1483,7 @@ mod tests {
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
             cwd: cwd.clone(),
+            token: None,
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
             managed_agent_kind: None,
@@ -1499,6 +1635,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            token: None,
                             label: None,
                             agent_name: None,
                             managed_agent_kind: None,
@@ -1665,6 +1802,7 @@ mod tests {
             0,
             super::super::snapshot::PaneSnapshot {
                 cwd: cwd.clone(),
+                token: None,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

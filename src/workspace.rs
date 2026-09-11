@@ -11,7 +11,7 @@ use crate::events::AppEvent;
 use crate::layout::PaneId;
 #[cfg(test)]
 use crate::layout::TileLayout;
-use crate::pane::{PaneLaunchEnv, PaneState};
+use crate::pane::{PaneLaunchEnv, PaneState, PaneToken};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
@@ -274,6 +274,7 @@ impl Workspace {
 
     pub fn new(
         initial_cwd: PathBuf,
+        token: PaneToken,
         rows: u16,
         cols: u16,
         scrollback_limit_bytes: usize,
@@ -286,6 +287,7 @@ impl Workspace {
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
             initial_cwd,
+            token,
             rows,
             cols,
             scrollback_limit_bytes,
@@ -303,6 +305,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_extra_env(
         initial_cwd: PathBuf,
+        token: PaneToken,
         rows: u16,
         cols: u16,
         scrollback_limit_bytes: usize,
@@ -317,6 +320,7 @@ impl Workspace {
         if extra_env.is_empty() {
             return Self::new(
                 initial_cwd,
+                token,
                 rows,
                 cols,
                 scrollback_limit_bytes,
@@ -330,6 +334,7 @@ impl Workspace {
         }
         Self::new_with_tab(
             initial_cwd,
+            token,
             rows,
             cols,
             scrollback_limit_bytes,
@@ -347,6 +352,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     fn new_with_tab(
         initial_cwd: PathBuf,
+        token: PaneToken,
         rows: u16,
         cols: u16,
         scrollback_limit_bytes: usize,
@@ -368,6 +374,7 @@ impl Workspace {
         let (tab, terminal, runtime) = if let Some(argv) = argv {
             Tab::new_argv_command(
                 1,
+                token,
                 initial_cwd.clone(),
                 rows,
                 cols,
@@ -383,6 +390,7 @@ impl Workspace {
         } else {
             Tab::new(
                 1,
+                token,
                 initial_cwd.clone(),
                 rows,
                 cols,
@@ -465,6 +473,7 @@ impl Workspace {
 
     pub fn create_tab(
         &mut self,
+        token: PaneToken,
         rows: u16,
         cols: u16,
         cwd: PathBuf,
@@ -476,6 +485,7 @@ impl Workspace {
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         self.create_tab_with_runtime(
             rows,
+            token,
             cols,
             cwd,
             scrollback_limit_bytes,
@@ -489,6 +499,7 @@ impl Workspace {
 
     pub fn create_tab_argv_command(
         &mut self,
+        token: PaneToken,
         rows: u16,
         cols: u16,
         cwd: PathBuf,
@@ -500,6 +511,7 @@ impl Workspace {
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         self.create_tab_with_runtime(
             rows,
+            token,
             cols,
             cwd,
             scrollback_limit_bytes,
@@ -514,6 +526,7 @@ impl Workspace {
     fn create_tab_with_runtime(
         &mut self,
         rows: u16,
+        token: PaneToken,
         cols: u16,
         cwd: PathBuf,
         scrollback_limit_bytes: usize,
@@ -543,6 +556,7 @@ impl Workspace {
         let (tab, terminal, runtime) = if let Some(argv) = argv {
             Tab::new_argv_command(
                 number,
+                token,
                 cwd,
                 rows,
                 cols,
@@ -558,6 +572,7 @@ impl Workspace {
         } else {
             Tab::new(
                 number,
+                token,
                 cwd,
                 rows,
                 cols,
@@ -625,6 +640,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     pub fn split_focused_command(
         &mut self,
+        token: PaneToken,
         direction: Direction,
         rows: u16,
         cols: u16,
@@ -645,6 +661,7 @@ impl Workspace {
             .active_tab_mut()
             .expect("workspace must always have at least one tab")
             .split_focused_command(
+                token,
                 direction,
                 rows,
                 cols,
@@ -664,6 +681,7 @@ impl Workspace {
     pub fn split_pane(
         &mut self,
         pane_id: PaneId,
+        token: PaneToken,
         direction: Direction,
         rows: u16,
         cols: u16,
@@ -677,6 +695,7 @@ impl Workspace {
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
             pane_id,
+            token,
             direction,
             None,
             rows,
@@ -696,6 +715,7 @@ impl Workspace {
     pub fn split_pane_with_ratio(
         &mut self,
         pane_id: PaneId,
+        token: PaneToken,
         direction: Direction,
         ratio: f32,
         rows: u16,
@@ -710,6 +730,7 @@ impl Workspace {
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
             pane_id,
+            token,
             direction,
             Some(ratio),
             rows,
@@ -729,6 +750,7 @@ impl Workspace {
     pub fn split_pane_argv_command(
         &mut self,
         pane_id: PaneId,
+        token: PaneToken,
         direction: Direction,
         rows: u16,
         cols: u16,
@@ -742,6 +764,7 @@ impl Workspace {
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
             pane_id,
+            token,
             direction,
             None,
             rows,
@@ -761,6 +784,7 @@ impl Workspace {
     pub fn split_pane_argv_command_with_ratio(
         &mut self,
         pane_id: PaneId,
+        token: PaneToken,
         direction: Direction,
         ratio: f32,
         rows: u16,
@@ -775,6 +799,7 @@ impl Workspace {
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
             pane_id,
+            token,
             direction,
             Some(ratio),
             rows,
@@ -794,6 +819,7 @@ impl Workspace {
     fn split_pane_with_runtime(
         &mut self,
         pane_id: PaneId,
+        token: PaneToken,
         direction: Direction,
         ratio: Option<f32>,
         rows: u16,
@@ -815,6 +841,7 @@ impl Workspace {
         let new_pane = match if let Some(argv) = argv {
             tab.split_pane_argv(
                 pane_id,
+                token,
                 focus_new_pane,
                 direction,
                 ratio,
@@ -830,6 +857,7 @@ impl Workspace {
         } else {
             tab.split_pane_shell(
                 pane_id,
+                token,
                 focus_new_pane,
                 direction,
                 ratio,
@@ -1179,7 +1207,10 @@ impl Workspace {
         let (layout, root_id) = TileLayout::new();
         let terminal_id = TerminalId::alloc();
         let mut panes = HashMap::new();
-        panes.insert(root_id, PaneState::new(terminal_id));
+        panes.insert(
+            root_id,
+            PaneState::new(terminal_id, PaneToken::alloc_for_test()),
+        );
         let tab = Tab {
             custom_name: None,
             number: 1,
@@ -1223,8 +1254,10 @@ impl Workspace {
     pub(crate) fn test_split(&mut self, direction: Direction) -> PaneId {
         let tab = self.active_tab_mut().expect("workspace must have tab");
         let new_id = tab.layout.split_focused(direction);
-        tab.panes
-            .insert(new_id, PaneState::new(TerminalId::alloc()));
+        tab.panes.insert(
+            new_id,
+            PaneState::new(TerminalId::alloc(), PaneToken::alloc_for_test()),
+        );
         self.register_new_pane(new_id);
         new_id
     }
@@ -1235,7 +1268,10 @@ impl Workspace {
         let render_dirty = Arc::new(RenderSignal::new());
         let (layout, root_id) = TileLayout::new();
         let mut panes = HashMap::new();
-        panes.insert(root_id, PaneState::new(TerminalId::alloc()));
+        panes.insert(
+            root_id,
+            PaneState::new(TerminalId::alloc(), PaneToken::alloc_for_test()),
+        );
         let tab = Tab {
             custom_name: name.map(str::to_string),
             number: self.next_public_tab_number,
@@ -1548,6 +1584,7 @@ mod tests {
     fn failed_moved_pane_insert_returns_pane_for_recovery() {
         let mut source = Workspace::test_new("source");
         let source_pane = source.tabs[0].root_pane;
+        let source_token = source.tabs[0].panes[&source_pane].token;
         let taken = source
             .take_pane_for_move(source_pane)
             .expect("source pane should be movable");
@@ -1566,6 +1603,7 @@ mod tests {
             .expect_err("invalid target should return the moved pane");
 
         assert_eq!(recovered.pane_id, source_pane);
+        assert_eq!(recovered.pane_state.token, source_token);
         assert!(!target.tabs[0].panes.contains_key(&source_pane));
     }
 

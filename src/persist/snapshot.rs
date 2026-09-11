@@ -98,6 +98,8 @@ pub struct TabSnapshot {
 pub struct PaneSnapshot {
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
@@ -314,7 +316,7 @@ fn capture_tab(
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
-    for id in tab.panes.keys() {
+    for (id, pane) in &tab.panes {
         let cwd = tab
             .cwd_for_pane(*id, terminals, terminal_runtimes)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
@@ -360,6 +362,7 @@ fn capture_tab(
             id.raw(),
             PaneSnapshot {
                 cwd,
+                token: Some(pane.token.to_string()),
                 label,
                 agent_name,
                 managed_agent_kind,
@@ -637,6 +640,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
+                token: None,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -648,6 +652,7 @@ mod tests {
             1,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/website"),
+                token: None,
                 label: Some("website".into()),
                 agent_name: None,
                 managed_agent_kind: None,
@@ -726,6 +731,22 @@ mod tests {
         assert_eq!(
             snap.workspaces[1].identity_cwd,
             PathBuf::from("/home/test/projects/project-b")
+        );
+    }
+
+    #[test]
+    fn capture_persists_native_pane_token() {
+        let state = state_with_workspaces(&["token"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let expected = state.workspaces[0].tabs[0].panes[&root].token.to_string();
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(
+            snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+                .token
+                .as_deref(),
+            Some(expected.as_str())
         );
     }
 
@@ -1201,6 +1222,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
+                token: None,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1214,6 +1236,7 @@ mod tests {
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
+                token: None,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

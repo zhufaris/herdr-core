@@ -117,11 +117,16 @@ impl App {
         };
         let (rows, cols) = self.state.estimate_pane_size();
         let previous_focus = self.state.current_pane_focus_target();
+        let token = match self.state.allocate_pane_token() {
+            Ok(token) => token,
+            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        };
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
         let result = ws.split_pane_argv_command(
             target_pane,
+            token,
             direction,
             rows.max(4),
             cols.max(10),
@@ -196,10 +201,15 @@ impl App {
                 Err((code, message)) => return encode_error(id, &code, message),
             };
         let (rows, cols) = self.state.estimate_pane_size();
+        let token = match self.state.allocate_pane_token() {
+            Ok(token) => token,
+            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        };
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
         let (tab_idx, terminal, runtime) = match ws.create_tab_argv_command(
+            token,
             rows.max(4),
             cols.max(10),
             cwd,

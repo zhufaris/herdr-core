@@ -22,13 +22,19 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
 }
 
-fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
-    let label = label.trim();
-    if label.is_empty() || pane_width <= 4 {
+fn pane_border_title(token: &str, label: Option<&str>, pane_width: u16) -> Option<String> {
+    if pane_width < 8 {
         return None;
     }
-    let max_label_width = pane_width.saturating_sub(4) as usize;
-    Some(format!(" {} ", truncate_end(label, max_label_width)))
+    let label = label.map(str::trim).filter(|label| !label.is_empty());
+    if let Some(label) = label.filter(|_| pane_width >= 12) {
+        let max_label_width = pane_width.saturating_sub(11) as usize;
+        return Some(format!(
+            " {token} · {} ",
+            truncate_end(label, max_label_width)
+        ));
+    }
+    Some(format!(" {token} "))
 }
 
 // Full view computation reaches this helper for active and background panes.
@@ -632,12 +638,13 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
-        let Some(title) = ws
-            .pane_state(info.id)
-            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
-        else {
+        let Some(title) = ws.pane_state(info.id).and_then(|pane| {
+            let label = app
+                .terminals
+                .get(&pane.attached_terminal_id)
+                .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders));
+            pane_border_title(pane.token.as_str(), label.as_deref(), info.rect.width)
+        }) else {
             continue;
         };
         let y = info.rect.y;
@@ -850,31 +857,30 @@ mod tests {
     #[test]
     fn pane_border_title_trims_and_truncates() {
         assert_eq!(
-            pane_border_title(" claude ", 20, false).as_deref(),
-            Some(" claude ")
+            pane_border_title("ab12", Some(" claude "), 20).as_deref(),
+            Some(" ab12 · claude ")
         );
         assert_eq!(
-            pane_border_title(" claude ", 20, true).as_deref(),
-            Some(" claude ")
-        );
-        assert_eq!(pane_border_title("", 20, false), None);
-        assert_eq!(
-            pane_border_title("abcdef", 8, false).as_deref(),
-            Some(" abc… ")
+            pane_border_title("ab12", None, 20).as_deref(),
+            Some(" ab12 ")
         );
         assert_eq!(
-            pane_border_title("abcdef", 8, true).as_deref(),
-            Some(" abc… ")
+            pane_border_title("ab12", Some("abcdef"), 14).as_deref(),
+            Some(" ab12 · ab… ")
         );
-        assert_eq!(pane_border_title("abcdef", 4, false), None);
+        assert_eq!(
+            pane_border_title("ab12", Some("abcdef"), 11).as_deref(),
+            Some(" ab12 ")
+        );
+        assert_eq!(pane_border_title("ab12", Some("abcdef"), 7), None);
     }
 
     #[test]
     fn pane_border_title_truncates_cjk_by_display_width() {
-        let title = pane_border_title("1 模块组织（已定）", 12, false).unwrap();
+        let title = pane_border_title("ab12", Some("1 模块组织（已定）"), 16).unwrap();
 
-        assert_eq!(title, " 1 模块… ");
-        assert!(display_width(title.as_str()) <= 10);
+        assert_eq!(title, " ab12 · 1 模… ");
+        assert!(display_width(title.as_str()) <= 14);
     }
 
     #[test]
@@ -904,9 +910,14 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(4, 0)].symbol(), "模");
-        assert_eq!(buffer[(5, 0)].symbol(), " ");
-        assert_eq!(buffer[(6, 0)].symbol(), "块");
+        let token = ws.tabs[0].panes[&pane_id].token.as_str();
+        for (offset, expected) in token.chars().enumerate() {
+            assert_eq!(
+                buffer[(2 + offset as u16, 0)].symbol(),
+                expected.to_string()
+            );
+        }
+        assert_eq!(buffer[(6, 0)].symbol(), " ");
     }
 
     #[test]

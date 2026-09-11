@@ -853,6 +853,13 @@
                 "null"
               ]
             },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "tokens": {
               "additionalProperties": {
                 "type": "string"
@@ -8013,6 +8020,13 @@
               ]
             },
             "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
               "type": [
                 "string",
                 "null"

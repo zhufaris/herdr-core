@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
 use crate::layout::{Node, PaneId, TileLayout};
-use crate::pane::{PaneLaunchEnv, PaneState};
+use crate::pane::{PaneLaunchEnv, PaneState, PaneToken};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
@@ -56,6 +56,7 @@ impl Tab {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         number: usize,
+        token: PaneToken,
         initial_cwd: PathBuf,
         rows: u16,
         cols: u16,
@@ -70,6 +71,7 @@ impl Tab {
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_runtime(
             number,
+            token,
             initial_cwd,
             rows,
             cols,
@@ -89,6 +91,7 @@ impl Tab {
     #[allow(clippy::too_many_arguments)]
     pub fn new_argv_command(
         number: usize,
+        token: PaneToken,
         initial_cwd: PathBuf,
         rows: u16,
         cols: u16,
@@ -103,6 +106,7 @@ impl Tab {
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_runtime(
             number,
+            token,
             initial_cwd,
             rows,
             cols,
@@ -121,6 +125,7 @@ impl Tab {
     #[allow(clippy::too_many_arguments)]
     fn new_with_runtime(
         number: usize,
+        token: PaneToken,
         initial_cwd: PathBuf,
         rows: u16,
         cols: u16,
@@ -176,7 +181,7 @@ impl Tab {
             None => TerminalState::new(terminal_id.clone(), initial_cwd),
         };
         let mut panes = HashMap::new();
-        panes.insert(root_id, PaneState::new(terminal_id));
+        panes.insert(root_id, PaneState::new(terminal_id, token));
 
         Ok((
             Self {
@@ -207,6 +212,7 @@ impl Tab {
 
     pub fn split_focused_command(
         &mut self,
+        token: PaneToken,
         direction: Direction,
         rows: u16,
         cols: u16,
@@ -219,6 +225,7 @@ impl Tab {
     ) -> std::io::Result<NewPane> {
         self.split_pane_with_runtime(
             self.layout.focused(),
+            token,
             true,
             direction,
             None,
@@ -244,6 +251,7 @@ impl Tab {
     pub(crate) fn split_pane_shell(
         &mut self,
         target: PaneId,
+        token: PaneToken,
         focus_new_pane: bool,
         direction: Direction,
         ratio: Option<f32>,
@@ -258,6 +266,7 @@ impl Tab {
     ) -> std::io::Result<NewPane> {
         self.split_pane_with_runtime(
             target,
+            token,
             focus_new_pane,
             direction,
             ratio,
@@ -279,6 +288,7 @@ impl Tab {
     pub(crate) fn split_pane_argv(
         &mut self,
         target: PaneId,
+        token: PaneToken,
         focus_new_pane: bool,
         direction: Direction,
         ratio: Option<f32>,
@@ -293,6 +303,7 @@ impl Tab {
     ) -> std::io::Result<NewPane> {
         self.split_pane_with_runtime(
             target,
+            token,
             focus_new_pane,
             direction,
             ratio,
@@ -313,6 +324,7 @@ impl Tab {
     fn split_pane_with_runtime(
         &mut self,
         target: PaneId,
+        token: PaneToken,
         focus_new_pane: bool,
         direction: Direction,
         ratio: Option<f32>,
@@ -408,7 +420,8 @@ impl Tab {
         if focus_new_pane {
             self.layout.focus_pane(new_id);
         }
-        self.panes.insert(new_id, PaneState::new(terminal_id));
+        self.panes
+            .insert(new_id, PaneState::new(terminal_id, token));
         self.zoomed = false;
         Ok(NewPane {
             pane_id: new_id,

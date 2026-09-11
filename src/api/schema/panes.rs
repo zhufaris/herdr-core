@@ -526,6 +526,9 @@ pub struct PaneReleaseAgentParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
     pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^[0-9a-z]{4}$"))]
+    pub token: Option<String>,
     pub terminal_id: String,
     pub workspace_id: String,
     pub tab_id: String,

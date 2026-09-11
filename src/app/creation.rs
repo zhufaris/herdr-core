@@ -130,8 +130,10 @@ impl App {
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<usize> {
         let (rows, cols) = self.state.estimate_pane_size();
+        let token = self.state.allocate_pane_token()?;
         let (ws, terminal, runtime) = Workspace::new_with_extra_env(
             initial_cwd,
+            token,
             rows,
             cols,
             self.state.pane_scrollback_limit_bytes,
@@ -330,6 +332,7 @@ impl App {
         let presentation = terminal.effective_presentation();
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
+            token: Some(pane.token.to_string()),
             terminal_id: terminal.id.to_string(),
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,

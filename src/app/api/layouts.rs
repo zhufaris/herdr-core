@@ -102,6 +102,10 @@ impl App {
             Ok(command) => command,
             Err(message) => return encode_error(id, "invalid_layout", message),
         };
+        let token = match self.state.allocate_pane_token() {
+            Ok(token) => token,
+            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        };
 
         let created = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
@@ -109,6 +113,7 @@ impl App {
             };
             if let Some(argv) = command.as_deref() {
                 ws.create_tab_argv_command(
+                    token,
                     rows,
                     cols,
                     first_cwd,
@@ -120,6 +125,7 @@ impl App {
                 )
             } else {
                 ws.create_tab(
+                    token,
                     rows,
                     cols,
                     first_cwd,
@@ -413,6 +419,10 @@ impl App {
             SplitDirection::Down => Direction::Vertical,
         };
         let command = layout_command(pane)?;
+        let token = self
+            .state
+            .allocate_pane_token()
+            .map_err(|err| err.to_string())?;
         let result = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err("workspace not found".into());
@@ -420,6 +430,7 @@ impl App {
             if let Some(argv) = command.as_deref() {
                 ws.split_pane_argv_command_with_ratio(
                     target_pane_id,
+                    token,
                     direction,
                     ratio,
                     rows,
@@ -435,6 +446,7 @@ impl App {
             } else {
                 ws.split_pane_with_ratio(
                     target_pane_id,
+                    token,
                     direction,
                     ratio,
                     rows,

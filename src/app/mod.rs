@@ -447,6 +447,7 @@ impl App {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
+            next_pane_token_candidate: state::initial_pane_token_candidate(),
             active,
             previous_pane_focus: None,
             selected,

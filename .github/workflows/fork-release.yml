@@ -109,8 +109,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/herdr" "${{ matrix.name }}"
           if [ "$RUNNER_OS" = Linux ]; then
             file "${{ matrix.name }}" | tee BUILD_INFO.txt
-            ldd "${{ matrix.name }}" 2>&1 | tee -a BUILD_INFO.txt
             grep -q "statically linked" BUILD_INFO.txt
+            ldd "${{ matrix.name }}" 2>&1 | tee -a BUILD_INFO.txt || true
             if nm -u "${{ matrix.name }}" 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
               echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
               exit 1

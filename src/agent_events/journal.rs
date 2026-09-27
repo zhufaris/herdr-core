@@ -444,7 +444,7 @@ fn timestamps_equal(left: &str, right: &str) -> bool {
         time::OffsetDateTime::parse(left, format),
         time::OffsetDateTime::parse(right, format),
     ) {
-        (Ok(left), Ok(right)) => left == right,
+        (Ok(left), Ok(right)) => left.unix_timestamp() == right.unix_timestamp(),
         _ => false,
     }
 }
@@ -453,6 +453,19 @@ fn timestamps_equal(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
     use crate::api::schema::agent_events::TranscriptKind;
+
+    #[test]
+    fn timestamp_comparison_tolerates_only_subsecond_precision_loss() {
+        assert!(timestamps_equal(
+            "2026-09-27T11:08:31.000Z",
+            "2026-09-27T11:08:31.667Z"
+        ));
+        assert!(!timestamps_equal(
+            "2026-09-27T11:08:31.999Z",
+            "2026-09-27T11:08:32.000Z"
+        ));
+    }
+
     #[test]
     fn byte_retention_prunes_more_than_one_old_batch() {
         let root =

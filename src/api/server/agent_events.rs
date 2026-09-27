@@ -3,7 +3,8 @@ use super::{dispatch_to_app_with_timeout, write_json_line_allow_disconnect};
 use crate::agent_events::Checkpoint;
 use crate::agent_events::{EventError, Journal, RegisteredSource, SourceReader};
 use crate::api::schema::agent_events::{
-    AgentEventsAttachParams, AgentEventsBatch, AgentEventsReadParams, TranscriptKind,
+    AgentEventsAttachParams, AgentEventsBatch, AgentEventsLocateParams, AgentEventsReadParams,
+    AgentEventsTurnCursor, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, PaneProcessInfoParams, Request, ResponseResult};
 use crate::api::ApiRequestSender;
@@ -164,6 +165,12 @@ impl ReplyStreams {
         self.with_journal(false, |j| {
             j.read(&params.source_id, &params.after, params.limit)
         })
+    }
+    pub fn locate(
+        &self,
+        params: &AgentEventsLocateParams,
+    ) -> crate::agent_events::Result<AgentEventsTurnCursor> {
+        self.with_journal(false, |j| j.locate(params))
     }
     pub fn read_failure(&self, id: &str, code: &str, source_id: &str) -> Value {
         let mut response = failure(id, code);

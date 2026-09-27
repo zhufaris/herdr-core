@@ -37,6 +37,32 @@ pub struct AgentEventsReadParams {
     #[schemars(range(min = 1, max = 128))]
     pub limit: u32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsTurnBoundary {
+    Active,
+    At,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsLocateParams {
+    pub source_id: String,
+    pub boundary: AgentEventsTurnBoundary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsTurnCursor {
+    pub source_id: String,
+    pub found: bool,
+    pub after_cursor: String,
+}
 fn default_limit() -> u32 {
     64
 }

@@ -231,9 +231,11 @@ fn handle_connection_with_events(
         },
         Method::AgentEventsAttach(_)
         | Method::AgentEventsSources(_)
-        | Method::AgentEventsRead(_) => {
+        | Method::AgentEventsRead(_)
+        | Method::AgentEventsLocate(_) => {
             let source_id = match &request.method {
                 Method::AgentEventsRead(params) => Some(params.source_id.clone()),
+                Method::AgentEventsLocate(params) => Some(params.source_id.clone()),
                 _ => None,
             };
             let result = match reply_streams {
@@ -242,6 +244,9 @@ fn handle_connection_with_events(
                     Method::AgentEventsRead(params) => service
                         .read(&params)
                         .map(|batch| ResponseResult::AgentEventsBatch { batch }),
+                    Method::AgentEventsLocate(params) => service
+                        .locate(&params)
+                        .map(|boundary| ResponseResult::AgentEventsTurnCursor { boundary }),
                     _ => service.sources(),
                 },
                 None => Err(crate::agent_events::EventError("events_unavailable")),
@@ -537,6 +542,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentEventsAttach(_) => "agent.events.attach",
         Method::AgentEventsSources(_) => "agent.events.sources",
         Method::AgentEventsRead(_) => "agent.events.read",
+        Method::AgentEventsLocate(_) => "agent.events.locate",
         Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",

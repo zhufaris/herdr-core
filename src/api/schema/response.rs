@@ -120,6 +120,10 @@ pub enum ResponseResult {
         #[serde(flatten)]
         batch: super::agent_events::AgentEventsBatch,
     },
+    AgentEventsTurnCursor {
+        #[serde(flatten)]
+        boundary: super::agent_events::AgentEventsTurnCursor,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

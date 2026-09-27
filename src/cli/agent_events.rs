@@ -1,5 +1,6 @@
 use crate::api::schema::agent_events::{
-    AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsReadParams, TranscriptKind,
+    AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsLocateParams, AgentEventsReadParams,
+    AgentEventsTurnBoundary, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -79,6 +80,29 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
                 Method::AgentEventsSubscribe(params)
             }
         }
+        "locate" => {
+            if values
+                .keys()
+                .any(|k| !["--source", "--boundary", "--turn-id", "--started-at"].contains(k))
+            {
+                return help();
+            }
+            let (Some(source), Some(boundary)) = (get("--source"), get("--boundary")) else {
+                return help();
+            };
+            let boundary = match boundary {
+                "active" => AgentEventsTurnBoundary::Active,
+                "at" => AgentEventsTurnBoundary::At,
+                "after" => AgentEventsTurnBoundary::After,
+                _ => return help(),
+            };
+            Method::AgentEventsLocate(AgentEventsLocateParams {
+                source_id: source.into(),
+                boundary,
+                turn_id: get("--turn-id").map(str::to_owned),
+                started_at: get("--started-at").map(str::to_owned),
+            })
+        }
         _ => return help(),
     };
     let request = Request {
@@ -109,6 +133,6 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     }
 }
 fn help() -> std::io::Result<i32> {
-    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
+    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
     Ok(2)
 }

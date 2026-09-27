@@ -1500,3 +1500,23 @@ fn agent_events_attach_defaults_to_end_and_accepts_start() {
         agent_events::AgentEventsAttachFrom::Start
     );
 }
+
+#[test]
+fn agent_events_locate_requires_an_explicit_boundary() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-locate",
+        "method": "agent.events.locate",
+        "params": {
+            "source_id": "source-1",
+            "boundary": "at",
+            "turn_id": "turn-1",
+            "started_at": "2026-09-27T00:00:00Z"
+        }
+    }))
+    .unwrap();
+    let Method::AgentEventsLocate(params) = request.method else {
+        panic!("expected agent.events.locate");
+    };
+    assert_eq!(params.boundary, agent_events::AgentEventsTurnBoundary::At);
+    assert_eq!(params.turn_id.as_deref(), Some("turn-1"));
+}

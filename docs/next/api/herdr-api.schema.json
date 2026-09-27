@@ -1264,6 +1264,34 @@
           ],
           "type": "object"
         },
+        "AgentEventsLocateParams": {
+          "additionalProperties": false,
+          "properties": {
+            "boundary": {
+              "$ref": "#/schemas/request/$defs/AgentEventsTurnBoundary"
+            },
+            "source_id": {
+              "type": "string"
+            },
+            "started_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "boundary"
+          ],
+          "type": "object"
+        },
         "AgentEventsReadParams": {
           "additionalProperties": false,
           "properties": {
@@ -1286,6 +1314,14 @@
             "after"
           ],
           "type": "object"
+        },
+        "AgentEventsTurnBoundary": {
+          "enum": [
+            "active",
+            "at",
+            "after"
+          ],
+          "type": "string"
         },
         "AgentPromptParams": {
           "properties": {
@@ -6230,6 +6266,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.events.locate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsLocateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.events.subscribe",
               "type": "string"
             },
@@ -10028,6 +10080,30 @@
                 "next_cursor",
                 "earliest_cursor",
                 "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "after_cursor": {
+                  "type": "string"
+                },
+                "found": {
+                  "type": "boolean"
+                },
+                "source_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_events_turn_cursor",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "source_id",
+                "found",
+                "after_cursor"
               ],
               "type": "object"
             },

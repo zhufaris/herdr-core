@@ -237,6 +237,8 @@ pub enum Method {
     AgentEventsSources(EmptyParams),
     #[serde(rename = "agent.events.read")]
     AgentEventsRead(agent_events::AgentEventsReadParams),
+    #[serde(rename = "agent.events.locate")]
+    AgentEventsLocate(agent_events::AgentEventsLocateParams),
     #[serde(rename = "agent.events.subscribe")]
     AgentEventsSubscribe(agent_events::AgentEventsReadParams),
     #[serde(rename = "events.subscribe")]

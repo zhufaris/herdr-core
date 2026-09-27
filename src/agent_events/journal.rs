@@ -2,7 +2,8 @@ use super::codec::Decoded;
 use super::source::Checkpoint;
 use super::{digest, now, EventError, RegisteredSource, Result};
 use crate::api::schema::agent_events::{
-    AgentEventSource, AgentEventsBatch, AgentReplyEvent, ReplyPayload,
+    AgentEventSource, AgentEventsBatch, AgentEventsLocateParams, AgentEventsTurnBoundary,
+    AgentEventsTurnCursor, AgentReplyEvent, ReplyPayload,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -298,6 +299,124 @@ impl Journal {
             latest_cursor: self.cursor(source, latest),
         })
     }
+    pub fn locate(&self, params: &AgentEventsLocateParams) -> Result<AgentEventsTurnCursor> {
+        let (floor, latest, checkpoint): (i64, i64, String) = self
+            .db
+            .query_row(
+                "SELECT floor,latest,checkpoint FROM sources WHERE id=?",
+                [&params.source_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(EventError("source_not_found"))?;
+        let exact = match (&params.turn_id, &params.started_at) {
+            (Some(turn_id), Some(started_at)) if !turn_id.is_empty() && !started_at.is_empty() => {
+                Some((turn_id.as_str(), started_at.as_str()))
+            }
+            (None, None) => None,
+            _ => return Err(EventError("invalid_turn_boundary")),
+        };
+        let start = match params.boundary {
+            AgentEventsTurnBoundary::Active => {
+                if exact.is_some() {
+                    return Err(EventError("invalid_turn_boundary"));
+                }
+                let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint)?;
+                let Some(turn_id) = checkpoint
+                    .pointer("/decoder/turn")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return Ok(AgentEventsTurnCursor {
+                        source_id: params.source_id.clone(),
+                        found: false,
+                        after_cursor: self.cursor(&params.source_id, latest),
+                    });
+                };
+                let start = self.turn_event(&params.source_id, turn_id, "start")?;
+                let completed = self.turn_event(&params.source_id, turn_id, "complete")?;
+                let aborted = self.turn_event(&params.source_id, turn_id, "abort")?;
+                if completed.is_some() || aborted.is_some() {
+                    None
+                } else {
+                    start.and_then(|(seq, event)| {
+                        matches!(event.payload, ReplyPayload::TurnStarted).then_some(seq)
+                    })
+                }
+            }
+            AgentEventsTurnBoundary::At | AgentEventsTurnBoundary::After => {
+                let Some((turn_id, started_at)) = exact else {
+                    return Err(EventError("invalid_turn_boundary"));
+                };
+                self.turn_event(&params.source_id, turn_id, "start")?
+                    .and_then(|(seq, event)| {
+                        (matches!(event.payload, ReplyPayload::TurnStarted)
+                            && event.turn_id.as_deref() == Some(turn_id)
+                            && timestamps_equal(&event.occurred_at, started_at))
+                        .then_some(seq)
+                    })
+            }
+        };
+        let Some(start) = start.filter(|seq| *seq > floor) else {
+            return Ok(AgentEventsTurnCursor {
+                source_id: params.source_id.clone(),
+                found: false,
+                after_cursor: self.cursor(&params.source_id, latest),
+            });
+        };
+        if params.boundary == AgentEventsTurnBoundary::After {
+            let Some((turn_id, _)) = exact else {
+                return Err(EventError("invalid_turn_boundary"));
+            };
+            let completed = self.turn_event(&params.source_id, turn_id, "complete")?;
+            let aborted = self.turn_event(&params.source_id, turn_id, "abort")?;
+            let terminal = [completed, aborted]
+                .into_iter()
+                .flatten()
+                .filter(|(seq, _)| *seq > start)
+                .map(|(seq, _)| seq)
+                .min();
+            let Some(terminal) = terminal.filter(|seq| *seq > floor) else {
+                return Ok(AgentEventsTurnCursor {
+                    source_id: params.source_id.clone(),
+                    found: false,
+                    after_cursor: self.cursor(&params.source_id, latest),
+                });
+            };
+            return Ok(AgentEventsTurnCursor {
+                source_id: params.source_id.clone(),
+                found: true,
+                after_cursor: self.cursor(&params.source_id, terminal),
+            });
+        }
+        let previous: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(seq),?) FROM events WHERE source=? AND seq<?",
+            params![floor, params.source_id, start],
+            |r| r.get(0),
+        )?;
+        Ok(AgentEventsTurnCursor {
+            source_id: params.source_id.clone(),
+            found: true,
+            after_cursor: self.cursor(&params.source_id, previous.max(floor)),
+        })
+    }
+    fn turn_event(
+        &self,
+        source_id: &str,
+        turn_id: &str,
+        kind: &str,
+    ) -> Result<Option<(i64, AgentReplyEvent)>> {
+        let key = format!("{turn_id}:{kind}:{turn_id}");
+        let row: Option<(i64, String)> = self
+            .db
+            .query_row(
+                "SELECT seq,body FROM events WHERE source=? AND key=?",
+                params![source_id, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(seq, body)| Ok((seq, serde_json::from_str(&body)?)))
+            .transpose()
+    }
     pub fn prune(&mut self) -> Result<()> {
         self.prune_to(MAX_EVENT_BYTES, now() - RETENTION_SECONDS)
     }
@@ -316,6 +435,17 @@ impl Journal {
         tx.execute("DELETE FROM events WHERE seq<=?", [through])?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn timestamps_equal(left: &str, right: &str) -> bool {
+    let format = &time::format_description::well_known::Rfc3339;
+    match (
+        time::OffsetDateTime::parse(left, format),
+        time::OffsetDateTime::parse(right, format),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -442,6 +572,167 @@ mod tests {
             "active"
         );
         drop(j);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn locates_exact_next_and_active_turns_without_scanning_history() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-boundary-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let source = RegisteredSource {
+            id: "source".into(),
+            terminal_id: "term".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session".into(),
+            path: "/unused".into(),
+            foreground_pid: 1,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let before = journal.attach(&source, &Checkpoint::default()).unwrap();
+        let mut next = before.clone();
+        next.offset = 10;
+        next.decoder
+            .decode(
+                TranscriptKind::Traex,
+                &serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-09-27T00:00:02Z",
+                    "payload": { "type": "task_started", "turn_id": "turn-2" }
+                }),
+            )
+            .unwrap();
+        let decoded = |key: &str, turn: &str, time: &str, payload| Decoded {
+            key: key.into(),
+            turn: Some(turn.into()),
+            time: time.into(),
+            payload,
+        };
+        journal
+            .commit(
+                &source,
+                &before,
+                &next,
+                vec![
+                    decoded(
+                        "start:turn-1",
+                        "turn-1",
+                        "2026-09-27T00:00:00Z",
+                        ReplyPayload::TurnStarted,
+                    ),
+                    decoded(
+                        "complete:turn-1",
+                        "turn-1",
+                        "2026-09-27T00:00:01Z",
+                        ReplyPayload::TurnCompleted,
+                    ),
+                    decoded(
+                        "start:turn-2",
+                        "turn-2",
+                        "2026-09-27T00:00:02Z",
+                        ReplyPayload::TurnStarted,
+                    ),
+                ],
+            )
+            .unwrap();
+
+        {
+            let locate = |boundary, turn_id: Option<&str>, started_at: Option<&str>| {
+                journal
+                    .locate(&AgentEventsLocateParams {
+                        source_id: "source".into(),
+                        boundary,
+                        turn_id: turn_id.map(str::to_owned),
+                        started_at: started_at.map(str::to_owned),
+                    })
+                    .unwrap()
+            };
+            let at_first = locate(
+                AgentEventsTurnBoundary::At,
+                Some("turn-1"),
+                Some("2026-09-27T00:00:00.000Z"),
+            );
+            assert!(at_first.found);
+            assert_eq!(
+                journal
+                    .read("source", &at_first.after_cursor, 1)
+                    .unwrap()
+                    .events[0]
+                    .turn_id
+                    .as_deref(),
+                Some("turn-1")
+            );
+            let after_first = locate(
+                AgentEventsTurnBoundary::After,
+                Some("turn-1"),
+                Some("2026-09-27T00:00:00Z"),
+            );
+            assert!(after_first.found);
+            assert_eq!(
+                journal
+                    .read("source", &after_first.after_cursor, 1)
+                    .unwrap()
+                    .events[0]
+                    .turn_id
+                    .as_deref(),
+                Some("turn-2")
+            );
+            let active = locate(AgentEventsTurnBoundary::Active, None, None);
+            assert!(active.found);
+            assert_eq!(
+                journal
+                    .read("source", &active.after_cursor, 1)
+                    .unwrap()
+                    .events[0]
+                    .turn_id
+                    .as_deref(),
+                Some("turn-2")
+            );
+
+            let plan: String = journal
+                .db
+                .query_row(
+                    "EXPLAIN QUERY PLAN SELECT seq,body FROM events WHERE source=? AND key=?",
+                    params!["source", "turn-1:start:turn-1"],
+                    |r| r.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains("sqlite_autoindex_events_1"), "{plan}");
+        }
+
+        let previous = next.clone();
+        next.offset = 20;
+        journal
+            .commit(
+                &source,
+                &previous,
+                &next,
+                vec![decoded(
+                    "complete:turn-2",
+                    "turn-2",
+                    "2026-09-27T00:00:03Z",
+                    ReplyPayload::TurnCompleted,
+                )],
+            )
+            .unwrap();
+        assert!(
+            !journal
+                .locate(&AgentEventsLocateParams {
+                    source_id: "source".into(),
+                    boundary: AgentEventsTurnBoundary::Active,
+                    turn_id: None,
+                    started_at: None,
+                })
+                .unwrap()
+                .found
+        );
+
+        drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

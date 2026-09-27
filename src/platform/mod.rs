@@ -269,7 +269,10 @@ pub(crate) use unix_common::{
 };
 
 mod client_state;
-pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
+pub(crate) use client_state::{
+    agent_event_file_identity, create_private_state_file, open_agent_event_source,
+    prepare_agent_event_directory, replace_file, sync_parent_directory,
+};
 
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}

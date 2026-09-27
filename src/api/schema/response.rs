@@ -107,6 +107,19 @@ pub enum ResponseResult {
     AgentList {
         agents: Vec<AgentInfo>,
     },
+    AgentEventsAttached {
+        source_id: String,
+        attach_offset: u64,
+        sources: Vec<super::agent_events::AgentEventSource>,
+    },
+    AgentEventsSources {
+        enabled: bool,
+        sources: Vec<super::agent_events::AgentEventSource>,
+    },
+    AgentEventsBatch {
+        #[serde(flatten)]
+        batch: super::agent_events::AgentEventsBatch,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

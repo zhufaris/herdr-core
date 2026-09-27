@@ -237,6 +237,7 @@ fn default_region() -> String {
 }
 
 const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
+    ("traex", include_str!("manifests/traex.toml")),
     ("amp", include_str!("manifests/amp.toml")),
     ("agy", include_str!("manifests/antigravity.toml")),
     ("claude", include_str!("manifests/claude.toml")),

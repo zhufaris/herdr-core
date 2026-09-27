@@ -316,6 +316,19 @@ fn notification_command() -> Command {
 fn agent_command() -> Command {
     Command::new("agent")
         .about("Control and inspect agent panes")
+        .subcommand(Command::new("events").about("Consume durable agent reply events")
+            .subcommand(Command::new("sources").about("List registered reply sources and cursor bounds"))
+            .subcommand(Command::new("attach").about("Register a verified agent transcript for durable capture")
+                .arg(option("pane", "ID").required(true))
+                .arg(option("kind", "KIND").value_parser(["traex", "pi"]).required(true))
+                .arg(option("session-id", "ID").required(true))
+                .arg(option("path", "PATH").required(true))
+                .arg(option("from", "POSITION").value_parser(["start", "end"])))
+            .subcommands(["read", "subscribe"].map(|name| Command::new(name)
+                .about(if name == "read" { "Read a bounded batch after a source cursor" } else { "Replay and follow durable reply events as JSONL" })
+                .arg(option("source", "ID").required(true))
+                .arg(option("after", "CURSOR"))
+                .arg(option("limit", "N")))))
         .subcommand(Command::new("list").about("List agents"))
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
@@ -1296,6 +1309,13 @@ mod tests {
         assert!(agent_start
             .get_arguments()
             .any(|arg| arg.get_id() == "agent_args"));
+    }
+
+    #[test]
+    fn spec_models_agent_events_attach_origin() {
+        let cmd = super::command();
+        let attach = command_path(&cmd, &["agent", "events", "attach"]);
+        assert_eq!(option_values(attach, "from"), ["start", "end"]);
     }
 
     fn long_help(path: &[&str]) -> String {

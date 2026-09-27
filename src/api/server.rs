@@ -22,6 +22,7 @@ use crate::ipc::{
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
+mod agent_events;
 mod pane_graphics_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -90,6 +91,7 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let reply_streams = agent_events::ReplyStreams::start(api_tx.clone(), running.clone());
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -99,14 +101,16 @@ fn start_server_inner(
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    let reply_streams = reply_streams.clone();
                     std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
+                        if let Err(err) = handle_connection_with_events(
                             stream,
                             &api_tx,
                             &event_hub,
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
+                            Some(&reply_streams),
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -153,13 +157,34 @@ fn handle_connection(
     handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
 }
 
+#[cfg(test)]
 fn handle_connection_with_stop(
+    stream: LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<()> {
+    handle_connection_with_events(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        server_stop,
+        None,
+    )
+}
+
+fn handle_connection_with_events(
     mut stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    reply_streams: Option<&agent_events::ReplyStreams>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -197,6 +222,41 @@ fn handle_connection_with_stop(
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
+        Method::AgentEventsSubscribe(params) => match reply_streams {
+            Some(service) => service.subscribe(stream, request_id, params, running),
+            None => write_json_line_allow_disconnect(
+                &mut stream,
+                &agent_events::failure(&request_id, "events_unavailable"),
+            ),
+        },
+        Method::AgentEventsAttach(_)
+        | Method::AgentEventsSources(_)
+        | Method::AgentEventsRead(_) => {
+            let source_id = match &request.method {
+                Method::AgentEventsRead(params) => Some(params.source_id.clone()),
+                _ => None,
+            };
+            let result = match reply_streams {
+                Some(service) => match request.method {
+                    Method::AgentEventsAttach(params) => service.attach(params, api_tx),
+                    Method::AgentEventsRead(params) => service
+                        .read(&params)
+                        .map(|batch| ResponseResult::AgentEventsBatch { batch }),
+                    _ => service.sources(),
+                },
+                None => Err(crate::agent_events::EventError("events_unavailable")),
+            };
+            let response = match result {
+                Ok(result) => serde_json::json!({"id":request_id,"result":result}),
+                Err(error) => match (reply_streams, source_id) {
+                    (Some(service), Some(source)) => {
+                        service.read_failure(&request_id, error.0, &source)
+                    }
+                    _ => agent_events::failure(&request_id, error.0),
+                },
+            };
+            write_json_line_allow_disconnect(&mut stream, &response)
+        }
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
@@ -474,6 +534,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneReleaseAgent(_) => "pane.release_agent",
         Method::PaneClose(_) => "pane.close",
         Method::PopupClose(_) => "popup.close",
+        Method::AgentEventsAttach(_) => "agent.events.attach",
+        Method::AgentEventsSources(_) => "agent.events.sources",
+        Method::AgentEventsRead(_) => "agent.events.read",
+        Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",

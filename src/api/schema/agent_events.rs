@@ -1,0 +1,113 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptKind {
+    Traex,
+    Pi,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsAttachFrom {
+    Start,
+    #[default]
+    End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsAttachParams {
+    pub pane_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub from: AgentEventsAttachFrom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsReadParams {
+    pub source_id: String,
+    pub after: String,
+    #[serde(default = "default_limit")]
+    #[schemars(range(min = 1, max = 128))]
+    pub limit: u32,
+}
+fn default_limit() -> u32 {
+    64
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentReplyEvent {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub cursor: String,
+    pub source_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub occurred_at: String,
+    pub payload: ReplyPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplyPayload {
+    TurnStarted,
+    TurnCompleted,
+    TurnAborted {
+        reason: String,
+    },
+    Message {
+        message_id: String,
+        channel: String,
+        text: String,
+        truncated: bool,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+        truncated: bool,
+    },
+    ToolResult {
+        call_id: String,
+        text: String,
+        is_error: bool,
+        truncated: bool,
+    },
+    BranchChanged {
+        parent_id: Option<String>,
+    },
+    SourceError {
+        code: String,
+    },
+    RecordSkipped {
+        code: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsBatch {
+    pub events: Vec<AgentReplyEvent>,
+    pub next_cursor: String,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventSource {
+    pub source_id: String,
+    pub terminal_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub state: String,
+    pub error: Option<String>,
+    pub checkpoint_offset: u64,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}

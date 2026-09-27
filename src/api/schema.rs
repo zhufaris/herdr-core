@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agent_events;
 pub mod agents;
 pub mod commands;
 pub mod common;
@@ -230,6 +231,14 @@ pub enum Method {
     PaneClose(PaneTarget),
     #[serde(rename = "popup.close")]
     PopupClose(EmptyParams),
+    #[serde(rename = "agent.events.attach")]
+    AgentEventsAttach(agent_events::AgentEventsAttachParams),
+    #[serde(rename = "agent.events.sources")]
+    AgentEventsSources(EmptyParams),
+    #[serde(rename = "agent.events.read")]
+    AgentEventsRead(agent_events::AgentEventsReadParams),
+    #[serde(rename = "agent.events.subscribe")]
+    AgentEventsSubscribe(agent_events::AgentEventsReadParams),
     #[serde(rename = "events.subscribe")]
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]

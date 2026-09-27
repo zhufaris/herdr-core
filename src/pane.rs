@@ -620,6 +620,11 @@ fn hinted_process_probe_result(
     pid: u32,
     read_hint: impl Fn(u32) -> Option<Agent>,
 ) -> Option<ProcessProbeResult> {
+    // TraeX embeds the Codex runtime and can expose its internal `HERDR_AGENT=codex`
+    // hint on the public `traex` process. The explicit executable is stronger here.
+    if let Some((Agent::Traex, process_name)) = identify_process_group_leader_in_job(job) {
+        return Some(process_probe_result(job, pid, Agent::Traex, process_name));
+    }
     let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
     Some(process_probe_result(
         job,

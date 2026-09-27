@@ -148,6 +148,7 @@ fn spawn_herdr_with_options(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_AGENT");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -1403,7 +1404,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nexport HERDR_AGENT=pi\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]

@@ -76,13 +76,18 @@ pub fn persisted_session_from_launch_args(
     let [command, session_id] = args else {
         return None;
     };
-    if agent != crate::detect::Agent::Codex || command != "resume" || session_id.starts_with('-') {
+    let (source, agent_label) = match agent {
+        crate::detect::Agent::Codex => ("herdr:codex", "codex"),
+        crate::detect::Agent::Traex => ("herdr:traex", "traex"),
+        _ => return None,
+    };
+    if command != "resume" || session_id.starts_with('-') {
         return None;
     }
 
     Some(PersistedAgentSession {
-        source: "herdr:codex".into(),
-        agent: "codex".into(),
+        source: source.into(),
+        agent: agent_label.into(),
         session_ref: AgentSessionRef::id(session_id.clone())?,
     })
 }
@@ -100,7 +105,8 @@ pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude")
+        ("herdr:traex", "traex")
+            | ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
@@ -139,6 +145,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     }
 
     let argv = match (source, agent, session_ref.kind) {
+        ("herdr:traex", "traex", AgentSessionRefKind::Id) => {
+            vec!["traex".into(), "resume".into(), session_ref.value.clone()]
+        }
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
             vec![
                 "claude".into(),
@@ -245,7 +254,8 @@ pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> S
 pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude")
+        ("herdr:traex", "traex")
+            | ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")

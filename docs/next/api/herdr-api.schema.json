@@ -1229,6 +1229,64 @@
     },
     "request": {
       "$defs": {
+        "AgentEventsAttachFrom": {
+          "enum": [
+            "start",
+            "end"
+          ],
+          "type": "string"
+        },
+        "AgentEventsAttachParams": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/request/$defs/TranscriptKind"
+            },
+            "from": {
+              "$ref": "#/schemas/request/$defs/AgentEventsAttachFrom",
+              "default": "end"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "agent_kind",
+            "session_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        "AgentEventsReadParams": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "type": "string"
+            },
+            "limit": {
+              "default": 64,
+              "format": "uint32",
+              "maximum": 128,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "source_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_id",
+            "after"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -4439,6 +4497,13 @@
           ],
           "type": "string"
         },
+        "TranscriptKind": {
+          "enum": [
+            "traex",
+            "pi"
+          ],
+          "type": "string"
+        },
         "WorkspaceCloseParams": {
           "properties": {
             "close_group": {
@@ -6117,6 +6182,70 @@
         {
           "properties": {
             "method": {
+              "const": "agent.events.attach",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsAttachParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.sources",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.subscribe",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "events.subscribe",
               "type": "string"
             },
@@ -6613,6 +6742,53 @@
     },
     "success_response": {
       "$defs": {
+        "AgentEventSource": {
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+            },
+            "checkpoint_offset": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "earliest_cursor": {
+              "type": "string"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "latest_cursor": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "source_id": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_id",
+            "terminal_id",
+            "agent_kind",
+            "session_id",
+            "state",
+            "checkpoint_offset",
+            "earliest_cursor",
+            "latest_cursor"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -6797,6 +6973,53 @@
             "source",
             "source_kind",
             "local_override_shadowing_remote"
+          ],
+          "type": "object"
+        },
+        "AgentReplyEvent": {
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+            },
+            "cursor": {
+              "type": "string"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "occurred_at": {
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/schemas/success_response/$defs/ReplyPayload"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "source_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "event_id",
+            "cursor",
+            "source_id",
+            "agent_kind",
+            "session_id",
+            "occurred_at",
+            "payload"
           ],
           "type": "object"
         },
@@ -9201,6 +9424,184 @@
           ],
           "type": "string"
         },
+        "ReplyPayload": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "turn_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "turn_completed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "turn_aborted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "message_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "message",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message_id",
+                "channel",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "arguments": {
+                  "type": "string"
+                },
+                "call_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "tool_call",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "call_id",
+                "name",
+                "arguments",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "is_error": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "tool_result",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "call_id",
+                "text",
+                "is_error",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "parent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "branch_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "source_error",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "code"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "record_skipped",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "code"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -9544,6 +9945,89 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "attach_offset": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "source_id": {
+                  "type": "string"
+                },
+                "sources": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentEventSource"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_events_attached",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "source_id",
+                "attach_offset",
+                "sources"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "sources": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentEventSource"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_events_sources",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "enabled",
+                "sources"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "earliest_cursor": {
+                  "type": "string"
+                },
+                "events": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentReplyEvent"
+                  },
+                  "type": "array"
+                },
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "next_cursor": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_events_batch",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "events",
+                "next_cursor",
+                "earliest_cursor",
+                "latest_cursor"
               ],
               "type": "object"
             },
@@ -10686,6 +11170,13 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "TranscriptKind": {
+          "enum": [
+            "traex",
+            "pi"
+          ],
+          "type": "string"
         },
         "WorkspaceInfo": {
           "properties": {

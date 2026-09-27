@@ -16,6 +16,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
+        "events" => super::agent_events::run(&args[1..]),
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),

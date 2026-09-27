@@ -1,0 +1,46 @@
+id = "traex"
+version = "2026.09.10.1"
+min_engine_version = 3
+updated_at = "2026-09-10T00:00:00Z"
+aliases = ["traecli", "traecode cli"]
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+visible_working = true
+regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+[[rules]]
+id = "startup_continue"
+state = "blocked"
+priority = 1000
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+contains = ["Welcome to TraeCode CLI", "Before you start:", "Press enter to continue"]
+
+[[rules]]
+id = "screen_working_fallback"
+state = "working"
+priority = 500
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = ['^[⋄◆] .+\([^)]*esc to (?:interrupt|cancel)[^)]*\).*$']
+
+[[rules]]
+id = "composer_idle"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(8)"
+visible_idle = true
+line_regex = ['^\s*❯(?:\s.*)?$']
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 90
+region = "osc_title"
+visible_idle = true
+regex = ['\S']
+not = [{ regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] }]

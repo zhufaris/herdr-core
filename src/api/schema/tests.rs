@@ -1458,3 +1458,45 @@ fn popup_close_request_round_trips() {
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
 }
+
+#[test]
+fn agent_events_attach_defaults_to_end_and_accepts_start() {
+    let default_request: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-default",
+        "method": "agent.events.attach",
+        "params": {
+            "pane_id": "w1:p1",
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "path": "/tmp/session.jsonl"
+        }
+    }))
+    .unwrap();
+    let Method::AgentEventsAttach(default_params) = default_request.method else {
+        panic!("expected agent.events.attach");
+    };
+    assert_eq!(
+        default_params.from,
+        agent_events::AgentEventsAttachFrom::End
+    );
+
+    let start_request: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-start",
+        "method": "agent.events.attach",
+        "params": {
+            "pane_id": "w1:p1",
+            "agent_kind": "pi",
+            "session_id": "session-2",
+            "path": "/tmp/session.jsonl",
+            "from": "start"
+        }
+    }))
+    .unwrap();
+    let Method::AgentEventsAttach(start_params) = start_request.method else {
+        panic!("expected agent.events.attach");
+    };
+    assert_eq!(
+        start_params.from,
+        agent_events::AgentEventsAttachFrom::Start
+    );
+}

@@ -88,6 +88,13 @@ pub enum ReplyPayload {
     TurnAborted {
         reason: String,
     },
+    HumanMessage {
+        message_id: String,
+        text: String,
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
+    },
     Message {
         message_id: String,
         channel: String,

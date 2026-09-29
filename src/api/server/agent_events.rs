@@ -1,7 +1,9 @@
 use super::{dispatch_to_app_with_timeout, write_json_line_allow_disconnect};
 #[cfg(test)]
 use crate::agent_events::Checkpoint;
-use crate::agent_events::{EventError, Journal, RegisteredSource, SourceReader};
+use crate::agent_events::{
+    EventError, Journal, RegisteredSource, SourceReader, SubmissionPrepareResult,
+};
 use crate::api::schema::agent_events::{
     AgentEventsAttachParams, AgentEventsBatch, AgentEventsLocateParams, AgentEventsReadParams,
     AgentEventsTurnCursor, TranscriptKind,
@@ -157,6 +159,58 @@ impl ReplyStreams {
             }),
             result => result,
         }
+    }
+
+    pub fn prepare_submission(
+        &self,
+        params: &crate::api::schema::AgentPromptParams,
+        api_tx: &ApiRequestSender,
+    ) -> crate::agent_events::Result<SubmissionPrepareResult> {
+        let submission_id = params
+            .submission_id
+            .as_deref()
+            .ok_or(EventError("invalid_submission_id"))?;
+        let expected_session_id = params
+            .expected_session_id
+            .as_deref()
+            .ok_or(EventError("session_identity_missing"))?;
+        let snapshot = request_snapshot(api_tx)?;
+        let pane = snapshot["panes"]
+            .as_array()
+            .and_then(|panes| panes.iter().find(|pane| pane["pane_id"] == params.target))
+            .ok_or(EventError("pane_not_found"))?;
+        let terminal_id = pane["terminal_id"]
+            .as_str()
+            .ok_or(EventError("terminal_identity_missing"))?;
+        let session = pane["agent_session"]
+            .as_object()
+            .ok_or(EventError("session_identity_missing"))?;
+        if session.get("value").and_then(Value::as_str) != Some(expected_session_id) {
+            return Err(EventError("session_identity_mismatch"));
+        }
+        let kind = match session.get("agent").and_then(Value::as_str) {
+            Some("traex") => TranscriptKind::Traex,
+            Some("pi") => TranscriptKind::Pi,
+            _ => return Err(EventError("agent_kind_mismatch")),
+        };
+        self.with_journal(true, |journal| {
+            journal.prepare_submission(
+                submission_id,
+                terminal_id,
+                kind,
+                expected_session_id,
+                &params.text,
+            )
+        })
+    }
+
+    pub fn cancel_prepared_submission(
+        &self,
+        submission_id: &str,
+    ) -> crate::agent_events::Result<()> {
+        self.with_journal(false, |journal| {
+            journal.cancel_prepared_submission(submission_id)
+        })
     }
     pub fn read(
         &self,

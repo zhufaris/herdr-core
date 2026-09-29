@@ -119,6 +119,21 @@ impl App {
                 "agent prompt must not be empty",
             ));
         }
+        if params
+            .submission_id
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
+            || params
+                .expected_session_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 512)
+        {
+            return Err(encode_error(
+                id,
+                "invalid_agent_prompt",
+                "agent prompt submission identity is invalid",
+            ));
+        }
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
@@ -189,6 +204,20 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        if let Some(expected_session_id) = params.expected_session_id.as_deref() {
+            if agent
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.as_str())
+                != Some(expected_session_id)
+            {
+                return Err(encode_error(
+                    id,
+                    "agent_session_changed",
+                    "agent native session no longer matches the prompt precondition",
+                ));
+            }
+        }
         let completion = runtime
             .queue_user_input_submission(
                 Bytes::from(text),
@@ -462,6 +491,8 @@ mod tests {
             AgentPromptParams {
                 target: public_pane_id,
                 text: "A != B".into(),
+                submission_id: Some("prompt-1".into()),
+                expected_session_id: None,
                 wait: None,
             },
         );
@@ -491,6 +522,8 @@ mod tests {
             AgentPromptParams {
                 target: "reviewer".into(),
                 text: "A != B".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             },
         );
@@ -506,6 +539,8 @@ mod tests {
             AgentPromptParams {
                 target: "opencode".into(),
                 text: "wrong target".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             },
         );
@@ -533,6 +568,8 @@ mod tests {
             AgentPromptParams {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             },
         );
@@ -573,6 +610,8 @@ mod tests {
             AgentPromptParams {
                 target: "reviewer".into(),
                 text: "A != B".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             },
         );
@@ -652,6 +691,8 @@ mod tests {
             AgentPromptParams {
                 target: "reviewer".into(),
                 text: "A != B".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             },
         );

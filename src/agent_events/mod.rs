@@ -2,7 +2,7 @@ mod codec;
 mod journal;
 mod source;
 
-pub(crate) use journal::Journal;
+pub(crate) use journal::{Journal, SubmissionPrepareResult};
 #[cfg(test)]
 pub(crate) use source::Checkpoint;
 pub(crate) use source::{RegisteredSource, SourceReader};

@@ -8,11 +8,22 @@ use std::sync::OnceLock;
 const MAX_TEXT: usize = 16 * 1024;
 const MAX_NODES: usize = 16_384;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingHumanMessage {
+    message_id: String,
+    text: String,
+    truncated: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Decoder {
     pub turn: Option<String>,
     #[serde(default)]
     awaiting_turn_boundary: bool,
+    #[serde(default)]
+    traex_turn_active: bool,
+    #[serde(default)]
+    pending_human_message: Option<PendingHumanMessage>,
     last_node: Option<String>,
     nodes: BTreeMap<String, Option<String>>,
     last_message: Option<(String, String)>,
@@ -60,6 +71,10 @@ fn bounded(s: &str) -> (String, bool) {
         value.push_str("\n[truncated]");
     }
     (value, truncated)
+}
+
+pub(crate) fn human_message_digest(value: &str) -> String {
+    digest(bounded(value).0.as_bytes())
 }
 
 fn redact(value: &str) -> String {
@@ -147,6 +162,22 @@ impl Decoder {
         ));
     }
 
+    fn human_message(id: &str, body: &str, out: &mut Vec<(String, ReplyPayload)>) {
+        if body.is_empty() {
+            return;
+        }
+        let (text, truncated) = bounded(body);
+        out.push((
+            format!("human:{id}:{}", digest(text.as_bytes())),
+            ReplyPayload::HumanMessage {
+                message_id: id.to_owned(),
+                text,
+                truncated,
+                submission_id: None,
+            },
+        ));
+    }
+
     fn traex(&mut self, v: &Value, out: &mut Vec<(String, ReplyPayload)>) -> Result<()> {
         let p = &v["payload"];
         match v["type"].as_str() {
@@ -155,8 +186,24 @@ impl Decoder {
                     let id = required(p, "turn_id")?.to_owned();
                     self.turn = Some(id.clone());
                     self.awaiting_turn_boundary = false;
+                    self.traex_turn_active = true;
                     self.last_message = None;
                     out.push((format!("start:{id}"), ReplyPayload::TurnStarted));
+                    if let Some(message) = self.pending_human_message.take() {
+                        out.push((
+                            format!(
+                                "human:{}:{}",
+                                message.message_id,
+                                digest(message.text.as_bytes())
+                            ),
+                            ReplyPayload::HumanMessage {
+                                message_id: message.message_id,
+                                text: message.text,
+                                truncated: message.truncated,
+                                submission_id: None,
+                            },
+                        ));
+                    }
                 }
                 Some("task_complete" | "turn_aborted") => {
                     let id = required(p, "turn_id")?;
@@ -197,6 +244,7 @@ impl Decoder {
                             },
                         ));
                     }
+                    self.traex_turn_active = false;
                 }
                 Some(_) => {}
                 None => return Err(EventError("invalid_record")),
@@ -231,6 +279,26 @@ impl Decoder {
 
     fn traex_item(&mut self, item: &Value, out: &mut Vec<(String, ReplyPayload)>) -> Result<()> {
         match item["type"].as_str() {
+            Some("message") if item["role"] == "user" => {
+                if self.awaiting_turn_boundary {
+                    return Ok(());
+                }
+                let message_id = required(item, "id")?;
+                let body = text(&item["content"]);
+                if body.is_empty() {
+                    return Ok(());
+                }
+                if self.traex_turn_active {
+                    Self::human_message(message_id, &body, out);
+                } else {
+                    let (text, truncated) = bounded(&body);
+                    self.pending_human_message = Some(PendingHumanMessage {
+                        message_id: message_id.to_owned(),
+                        text,
+                        truncated,
+                    });
+                }
+            }
             Some("message") if item["role"] == "assistant" => {
                 if matches!(item["channel"].as_str(), Some("analysis" | "reasoning")) {
                     return Ok(());
@@ -342,6 +410,7 @@ impl Decoder {
                     Some("user") => {
                         self.turn = Some(id.clone());
                         out.push((format!("start:{id}"), ReplyPayload::TurnStarted));
+                        Self::human_message(&id, &text(&m["content"]), out);
                     }
                     Some("assistant") => {
                         if self.turn.is_none() {
@@ -429,6 +498,81 @@ impl Decoder {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn traex_projects_user_message_at_the_native_turn_boundary() {
+        let mut decoder = Decoder::default();
+        let before_start = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"response_item",
+                    "payload":{
+                        "type":"message",
+                        "id":"user-1",
+                        "role":"user",
+                        "content":[{"type":"input_text","text":"continue"}]
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(before_start.is_empty());
+
+        let events = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            )
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].payload, ReplyPayload::TurnStarted));
+        assert!(matches!(
+            &events[1].payload,
+            ReplyPayload::HumanMessage {
+                message_id,
+                text,
+                truncated: false,
+                submission_id: None,
+            } if message_id == "user-1" && text == "continue"
+        ));
+        assert!(events
+            .iter()
+            .all(|event| event.turn.as_deref() == Some("turn-1")));
+    }
+
+    #[test]
+    fn pi_projects_user_message_with_its_native_turn_identity() {
+        let mut decoder = Decoder::default();
+        let events = decoder
+            .decode(
+                TranscriptKind::Pi,
+                &json!({
+                    "type":"message",
+                    "id":"user-1",
+                    "parentId":null,
+                    "message":{
+                        "role":"user",
+                        "content":[{"type":"text","text":"continue"}]
+                    }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].payload, ReplyPayload::TurnStarted));
+        assert!(matches!(
+            &events[1].payload,
+            ReplyPayload::HumanMessage {
+                message_id,
+                text,
+                truncated: false,
+                submission_id: None,
+            } if message_id == "user-1" && text == "continue"
+        ));
+        assert!(events
+            .iter()
+            .all(|event| event.turn.as_deref() == Some("user-1")));
+    }
     #[test]
     fn traex_filters_reasoning_and_updates_final_message_identity() {
         let mut d = Decoder::default();

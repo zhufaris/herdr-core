@@ -138,11 +138,15 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            submission_id: Some("prompt-1".into()),
+            expected_session_id: Some("session-1".into()),
             wait: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
     assert_eq!(prompt_json["method"], "agent.prompt");
+    assert_eq!(prompt_json["params"]["submission_id"], "prompt-1");
+    assert_eq!(prompt_json["params"]["expected_session_id"], "session-1");
     assert_eq!(
         serde_json::from_value::<Request>(prompt_json).unwrap(),
         prompt
@@ -153,6 +157,8 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            submission_id: None,
+            expected_session_id: None,
             wait: Some(AgentPromptWaitOptions {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),

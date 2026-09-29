@@ -180,6 +180,10 @@ pub struct AgentPromptParams {
     pub target: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
 }
 

@@ -835,6 +835,8 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         method: Method::AgentPrompt(AgentPromptParams {
             target: target.clone(),
             text: text.clone(),
+            submission_id: None,
+            expected_session_id: None,
             wait: wait.then_some(AgentPromptWaitOptions {
                 until,
                 timeout_ms,

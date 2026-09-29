@@ -312,6 +312,28 @@ fn handle_connection_with_events(
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         Method::AgentPrompt(params) => {
+            let submission_id = params.submission_id.clone();
+            if submission_id.is_some() {
+                let prepared = match reply_streams {
+                    Some(service) => service.prepare_submission(&params, api_tx),
+                    None => Err(crate::agent_events::EventError("events_unavailable")),
+                };
+                match prepared {
+                    Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
+                    Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
+                        return write_json_line_allow_disconnect(
+                            &mut stream,
+                            &agent_events::failure(&request_id, "submission_duplicate"),
+                        );
+                    }
+                    Err(error) => {
+                        return write_json_line_allow_disconnect(
+                            &mut stream,
+                            &agent_events::failure(&request_id, error.0),
+                        );
+                    }
+                }
+            }
             let response = prompt_agent(
                 request_id.clone(),
                 params,
@@ -320,6 +342,31 @@ fn handle_connection_with_events(
                 event_hub,
                 running,
             )?;
+            if let (Some(service), Some(submission_id), Some(response)) =
+                (reply_streams, submission_id.as_deref(), response.as_deref())
+            {
+                let code = serde_json::from_str::<serde_json::Value>(response)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/error/code")
+                            .and_then(|code| code.as_str())
+                            .map(str::to_owned)
+                    });
+                if matches!(
+                    code.as_deref(),
+                    Some(
+                        "empty_agent_prompt"
+                            | "invalid_agent_prompt"
+                            | "agent_not_found"
+                            | "agent_not_ready"
+                            | "agent_blocked"
+                            | "agent_session_changed"
+                    )
+                ) {
+                    let _ = service.cancel_prepared_submission(submission_id);
+                }
+            }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         Method::AgentWait(params) => {
@@ -997,6 +1044,8 @@ fn caller_timeout_dispatch_uses_timeout_error() {
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
                 target: "reviewer".into(),
                 text: "review this".into(),
+                submission_id: None,
+                expected_session_id: None,
                 wait: None,
             }),
         },

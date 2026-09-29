@@ -12,6 +12,12 @@ const MAX_SOURCES: i64 = 256;
 const RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 const MAX_EVENT_BYTES: i64 = 192 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionPrepareResult {
+    Prepared,
+    Duplicate,
+}
+
 pub(crate) struct Journal {
     db: Connection,
     id: String,
@@ -45,6 +51,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, definition TEXT NOT NULL, checkpoint TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', error TEXT, floor INTEGER NOT NULL DEFAULT 0, latest INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE(source,key));
             CREATE INDEX IF NOT EXISTS events_source_seq ON events(source,seq);
+            CREATE TABLE IF NOT EXISTS pending_submissions (submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL, text_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','consumed')), created INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
             PRAGMA user_version=1;")?;
         let id = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
             r.get(0)
@@ -90,6 +98,58 @@ impl Journal {
             params![source.id, definition, serde_json::to_string(initial)?],
         )?;
         Ok(initial.clone())
+    }
+
+    pub(crate) fn prepare_submission(
+        &mut self,
+        submission_id: &str,
+        terminal_id: &str,
+        agent_kind: crate::api::schema::agent_events::TranscriptKind,
+        session_id: &str,
+        text: &str,
+    ) -> Result<SubmissionPrepareResult> {
+        if submission_id.is_empty() || submission_id.len() > 256 {
+            return Err(EventError("invalid_submission_id"));
+        }
+        let kind = match agent_kind {
+            crate::api::schema::agent_events::TranscriptKind::Traex => "traex",
+            crate::api::schema::agent_events::TranscriptKind::Pi => "pi",
+        };
+        let text_digest = super::codec::human_message_digest(text);
+        let existing: Option<(String, String, String, String)> = self
+            .db
+            .query_row(
+                "SELECT terminal_id,agent_kind,session_id,text_digest FROM pending_submissions WHERE submission_id=?",
+                [submission_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing
+                == (
+                    terminal_id.to_owned(),
+                    kind.to_owned(),
+                    session_id.to_owned(),
+                    text_digest,
+                )
+            {
+                return Ok(SubmissionPrepareResult::Duplicate);
+            }
+            return Err(EventError("submission_identity_conflict"));
+        }
+        self.db.execute(
+            "INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created) VALUES (?,?,?,?,?,'prepared',?)",
+            params![submission_id, terminal_id, kind, session_id, text_digest, now()],
+        )?;
+        Ok(SubmissionPrepareResult::Prepared)
+    }
+
+    pub(crate) fn cancel_prepared_submission(&mut self, submission_id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM pending_submissions WHERE submission_id=? AND state='prepared'",
+            [submission_id],
+        )?;
+        Ok(())
     }
     pub(crate) fn pending(&self, verify_all: bool) -> Result<Vec<(RegisteredSource, Checkpoint)>> {
         let mut stmt = self.db.prepare("SELECT definition,json_extract(checkpoint,'$.offset') FROM sources WHERE state='active'")?;
@@ -144,7 +204,35 @@ impl Journal {
         if changed != 1 {
             return Err(EventError("checkpoint_conflict"));
         }
-        for event in events {
+        for mut event in events {
+            if let ReplyPayload::HumanMessage {
+                text,
+                submission_id,
+                ..
+            } = &mut event.payload
+            {
+                if submission_id.is_none() {
+                    let kind = match source.kind {
+                        crate::api::schema::agent_events::TranscriptKind::Traex => "traex",
+                        crate::api::schema::agent_events::TranscriptKind::Pi => "pi",
+                    };
+                    let text_digest = super::codec::human_message_digest(text);
+                    let matched: Option<String> = tx
+                        .query_row(
+                            "SELECT submission_id FROM pending_submissions WHERE terminal_id=? AND agent_kind=? AND session_id=? AND text_digest=? AND state='prepared' ORDER BY created,rowid LIMIT 1",
+                            params![source.terminal_id, kind, source.session_id, text_digest],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(matched) = matched {
+                        tx.execute(
+                            "UPDATE pending_submissions SET state='consumed' WHERE submission_id=? AND state='prepared'",
+                            [&matched],
+                        )?;
+                        *submission_id = Some(matched);
+                    }
+                }
+            }
             let key = format!("{}:{}", event.turn.as_deref().unwrap_or(""), event.key);
             let body = AgentReplyEvent {
                 schema_version: 1,
@@ -585,6 +673,94 @@ mod tests {
             "active"
         );
         drop(j);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accepted_submission_is_bound_once_to_the_matching_human_message() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-submission-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let source = RegisteredSource {
+            id: "source".into(),
+            terminal_id: "term".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session".into(),
+            path: "/unused".into(),
+            foreground_pid: 1,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let before = journal.attach(&source, &Checkpoint::default()).unwrap();
+        assert_eq!(
+            journal
+                .prepare_submission(
+                    "prompt-1",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "continue"
+                )
+                .unwrap(),
+            SubmissionPrepareResult::Prepared
+        );
+        assert_eq!(
+            journal
+                .prepare_submission(
+                    "prompt-1",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "continue"
+                )
+                .unwrap(),
+            SubmissionPrepareResult::Duplicate
+        );
+        let mut next = before.clone();
+        next.offset = 10;
+        journal
+            .commit(
+                &source,
+                &before,
+                &next,
+                vec![Decoded {
+                    key: "human:user-1".into(),
+                    turn: Some("turn-1".into()),
+                    time: "2026-09-28T00:00:00Z".into(),
+                    payload: ReplyPayload::HumanMessage {
+                        message_id: "user-1".into(),
+                        text: "continue".into(),
+                        truncated: false,
+                        submission_id: None,
+                    },
+                }],
+            )
+            .unwrap();
+
+        let batch = journal.read("source", "start", 64).unwrap();
+        assert!(matches!(
+            &batch.events[0].payload,
+            ReplyPayload::HumanMessage { submission_id: Some(id), .. } if id == "prompt-1"
+        ));
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .prepare_submission(
+                    "prompt-1",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "continue"
+                )
+                .unwrap(),
+            SubmissionPrepareResult::Duplicate
+        );
+        drop(reopened);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

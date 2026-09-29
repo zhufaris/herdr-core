@@ -1325,6 +1325,18 @@
         },
         "AgentPromptParams": {
           "properties": {
+            "expected_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "submission_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "target": {
               "type": "string"
             },
@@ -9515,6 +9527,36 @@
               "required": [
                 "type",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "submission_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "human_message",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message_id",
+                "text",
+                "truncated"
               ],
               "type": "object"
             },

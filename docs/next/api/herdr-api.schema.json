@@ -1323,6 +1323,33 @@
           ],
           "type": "string"
         },
+        "AgentPromptModelParams": {
+          "properties": {
+            "expected_session_id": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "submission_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "model",
+            "submission_id",
+            "expected_session_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "expected_session_id": {
@@ -5579,6 +5606,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_model",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptModelParams"
             }
           },
           "required": [
@@ -10011,6 +10054,12 @@
               "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "submission_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "agent_prompted",

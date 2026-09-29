@@ -244,6 +244,33 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     })
 }
 
+pub fn plan_traex_with_model(
+    session_ref: &AgentSessionRef,
+    model: &str,
+) -> Option<AgentResumePlan> {
+    if session_ref.kind != AgentSessionRefKind::Id
+        || model.is_empty()
+        || model.len() > 256
+        || model.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(AgentResumePlan {
+        agent: "traex".into(),
+        argv: vec![
+            "traex".into(),
+            "resume".into(),
+            session_ref.value.clone(),
+            "--model".into(),
+            model.into(),
+        ],
+        dedupe_key: format!(
+            "{}\u{0}model\u{0}{model}",
+            dedupe_key("herdr:traex", "traex", session_ref)
+        ),
+    })
+}
+
 pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> String {
     format!(
         "{source}\u{0}{agent}\u{0}{:?}\u{0}{}",
@@ -342,6 +369,27 @@ mod tests {
             ]
         )
         .is_none());
+    }
+
+    #[test]
+    fn traex_model_resume_plan_uses_the_official_interactive_cli() {
+        let session = AgentSessionRef::id("01a0e7ee-051f-7921-a1ac-9bcce2721937").unwrap();
+        let plan = plan_traex_with_model(&session, "gpt-5.4").unwrap();
+
+        assert_eq!(
+            plan.argv,
+            vec![
+                "traex",
+                "resume",
+                "01a0e7ee-051f-7921-a1ac-9bcce2721937",
+                "--model",
+                "gpt-5.4",
+            ]
+        );
+        assert_eq!(
+            plan.dedupe_key,
+            "herdr:traex\x00traex\x00Id\x0001a0e7ee-051f-7921-a1ac-9bcce2721937\x00model\x00gpt-5.4"
+        );
     }
 
     #[test]

@@ -216,6 +216,34 @@ impl App {
                     self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                     self.emit_pane_state_update(&update);
                 }
+                let pending_resume_terminal = self.find_pane(*pane_id).and_then(|(_, pane)| {
+                    self.state
+                        .terminals
+                        .get(&pane.attached_terminal_id)
+                        .and_then(|terminal| {
+                            terminal
+                                .pending_agent_resume_plan
+                                .as_ref()
+                                .map(|_| pane.attached_terminal_id.clone())
+                        })
+                });
+                if let Some(terminal_id) = pending_resume_terminal {
+                    let (rows, cols) = self
+                        .state
+                        .view
+                        .pane_infos
+                        .iter()
+                        .find(|info| info.id == *pane_id)
+                        .map(|info| (info.inner_rect.height, info.inner_rect.width))
+                        .unwrap_or_else(|| self.state.estimate_pane_size());
+                    if self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true)
+                    {
+                        self.overlay_panes.remove(pane_id);
+                        self.render_dirty.request_generic();
+                        self.render_notify.notify_one();
+                        return worktree_restore_updates;
+                    }
+                }
                 if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                     && self.respawn_shell_for_launch_pane(*pane_id, true)
                 {
@@ -1067,6 +1095,13 @@ impl App {
                     request.id,
                     "invalid_request",
                     "agent.prompt is handled asynchronously by the app runtime",
+                );
+            }
+            Method::AgentPromptModel(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "agent.prompt_model is handled asynchronously by the app runtime",
                 );
             }
             Method::AgentWait(_) => {
@@ -2267,6 +2302,69 @@ mod tests {
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
         assert!(terminal.agent_name.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_died_runs_pending_model_resume_without_clearing_session_identity() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("model-resume");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.state.view.pane_infos = app.state.workspaces[0].tabs[0]
+            .layout
+            .panes(app.state.view.terminal_area);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("primary".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("traex-session").unwrap(),
+        });
+        terminal.prepare_agent_runtime_replacement(crate::agent_resume::AgentResumePlan {
+            agent: "traex".into(),
+            argv: vec![
+                "traex".into(),
+                "resume".into(),
+                "traex-session".into(),
+                "--model".into(),
+                "gpt-5.4".into(),
+            ],
+            dedupe_key: "model-resume".into(),
+        });
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+
+        assert!(app.find_pane(pane_id).is_some());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_some());
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(!terminal.respawn_shell_on_exit);
+        assert_eq!(terminal.agent_name.as_deref(), Some("primary"));
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("traex-session")
+        );
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();

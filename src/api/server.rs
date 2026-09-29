@@ -14,7 +14,9 @@ use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
-use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
+use crate::api::wait::{
+    prompt_agent, prompt_agent_after_model_resume, wait_for_agent, wait_for_event, wait_for_output,
+};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
@@ -369,6 +371,77 @@ fn handle_connection_with_events(
             }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        Method::AgentPromptModel(params) => {
+            let before = dispatch_to_app_with_timeout(
+                Request {
+                    id: format!("{request_id}:before"),
+                    method: Method::AgentGet(crate::api::schema::AgentTarget {
+                        target: params.target.clone(),
+                    }),
+                },
+                api_tx,
+                Some(APP_RESPONSE_TIMEOUT),
+            );
+            let before_value: serde_json::Value = serde_json::from_str(&before)
+                .unwrap_or_else(|_| serde_json::json!({"error":{"code":"internal_error"}}));
+            let Some(expected_terminal_id) = before_value
+                .pointer("/result/agent/terminal_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+            else {
+                return write_text_line_allow_disconnect(&mut stream, &before);
+            };
+            let begin_response = dispatch_to_app_with_timeout(
+                Request {
+                    id: request_id.clone(),
+                    method: Method::AgentPromptModel(params.clone()),
+                },
+                api_tx,
+                None,
+            );
+            if serde_json::from_str::<serde_json::Value>(&begin_response)
+                .ok()
+                .is_none_or(|value| value.get("error").is_some())
+            {
+                return write_text_line_allow_disconnect(&mut stream, &begin_response);
+            }
+            let submission_params = crate::api::schema::AgentPromptParams {
+                target: params.target.clone(),
+                text: params.text.clone(),
+                submission_id: Some(params.submission_id.clone()),
+                expected_session_id: Some(params.expected_session_id.clone()),
+                wait: None,
+            };
+            let prepared = match reply_streams {
+                Some(service) => service.prepare_submission(&submission_params, api_tx),
+                None => Err(crate::agent_events::EventError("events_unavailable")),
+            };
+            match prepared {
+                Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
+                Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
+                    return write_json_line_allow_disconnect(
+                        &mut stream,
+                        &agent_events::failure(&request_id, "submission_duplicate"),
+                    );
+                }
+                Err(error) => {
+                    return write_json_line_allow_disconnect(
+                        &mut stream,
+                        &agent_events::failure(&request_id, error.0),
+                    );
+                }
+            }
+            let response = prompt_agent_after_model_resume(
+                request_id.clone(),
+                params,
+                expected_terminal_id,
+                &mut stream,
+                api_tx,
+                event_hub,
+                running,
+            )?;
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
@@ -541,6 +614,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentPromptModel(_) => "agent.prompt_model",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",

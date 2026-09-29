@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentPromptModelParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
+    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -772,7 +773,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: herdr agent prompt <target> <text> [--submission-id ID] [--expected-session-id ID] [--wait] [--until STATUS]... [--timeout MS]"
         );
         return Ok(2);
     };
@@ -783,6 +784,9 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
+    let mut submission_id = None;
+    let mut expected_session_id = None;
+    let mut model = None;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -816,6 +820,30 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
+            "--submission-id" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --submission-id");
+                    return Ok(2);
+                };
+                submission_id = Some(value.clone());
+                index += 2;
+            }
+            "--expected-session-id" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --expected-session-id");
+                    return Ok(2);
+                };
+                expected_session_id = Some(value.clone());
+                index += 2;
+            }
+            "--model" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --model");
+                    return Ok(2);
+                };
+                model = Some(value.clone());
+                index += 2;
+            }
             option => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -830,19 +858,42 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         eprintln!("--timeout requires --wait");
         return Ok(2);
     }
-    let response = super::send_request(&Request {
-        id: "cli:agent:prompt".into(),
-        method: Method::AgentPrompt(AgentPromptParams {
+    let method = if let Some(model) = model {
+        if wait {
+            eprintln!("--wait is not supported with --model");
+            return Ok(2);
+        }
+        let Some(submission_id) = submission_id else {
+            eprintln!("--model requires --submission-id");
+            return Ok(2);
+        };
+        let Some(expected_session_id) = expected_session_id else {
+            eprintln!("--model requires --expected-session-id");
+            return Ok(2);
+        };
+        Method::AgentPromptModel(AgentPromptModelParams {
             target: target.clone(),
             text: text.clone(),
-            submission_id: None,
-            expected_session_id: None,
+            model,
+            submission_id,
+            expected_session_id,
+        })
+    } else {
+        Method::AgentPrompt(AgentPromptParams {
+            target: target.clone(),
+            text: text.clone(),
+            submission_id,
+            expected_session_id,
             wait: wait.then_some(AgentPromptWaitOptions {
                 until,
                 timeout_ms,
                 submission_deadline: None,
             }),
-        }),
+        })
+    };
+    let response = super::send_request(&Request {
+        id: "cli:agent:prompt".into(),
+        method,
     })?;
     super::print_response(&response)
 }
@@ -932,7 +983,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent prompt <target> <text> [--submission-id ID] [--expected-session-id ID] [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");

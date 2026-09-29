@@ -3,14 +3,20 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptModelParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+type QueuedAgentPrompt = (
+    String,
+    crate::api::schema::AgentInfo,
+    Option<String>,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+);
 
 fn agent_prompt_submit_delay(agent: crate::detect::Agent, prompt_bytes: usize) -> Duration {
     #[cfg(windows)]
@@ -76,42 +82,122 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
-        };
-        match self.queue_agent_prompt(request.id, params) {
-            Ok((id, agent, completion)) => {
-                std::thread::spawn(move || {
-                    let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
-                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
-                            encode_error(id, "timeout", err.to_string())
-                        }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
-                        Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
-                    };
-                    let _ = respond_to.send(response);
-                });
+        match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => {
+                match self.queue_agent_prompt(request.id, params) {
+                    Ok((id, agent, submission_id, completion)) => {
+                        std::thread::spawn(move || {
+                            let response = match completion.recv() {
+                                Ok(Ok(())) => encode_success(
+                                    id,
+                                    ResponseResult::AgentPrompted {
+                                        agent,
+                                        submission_id,
+                                    },
+                                ),
+                                Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
+                                    encode_error(id, "timeout", err.to_string())
+                                }
+                                Ok(Err(err)) => {
+                                    encode_error(id, "agent_prompt_failed", err.to_string())
+                                }
+                                Err(_) => {
+                                    encode_error(id, "agent_prompt_failed", "pty actor closed")
+                                }
+                            };
+                            let _ = respond_to.send(response);
+                        });
+                    }
+                    Err(response) => {
+                        let _ = respond_to.send(response);
+                    }
+                }
             }
-            Err(response) => {
+            crate::api::schema::Method::AgentPromptModel(params) => {
+                let response = self.begin_agent_model_resume(request.id, params);
                 let _ = respond_to.send(response);
             }
+            _ => return false,
         }
         true
+    }
+
+    fn begin_agent_model_resume(&mut self, id: String, params: AgentPromptModelParams) -> String {
+        if params.text.is_empty()
+            || params.submission_id.is_empty()
+            || params.submission_id.len() > 256
+            || params.expected_session_id.is_empty()
+            || params.expected_session_id.len() > 512
+        {
+            return encode_error(
+                id,
+                "invalid_agent_prompt",
+                "model prompt identity or text is invalid",
+            );
+        }
+        let resolved = match self.resolve_agent_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return agent_not_found(id, &params.target);
+        };
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        if terminal.state != crate::detect::AgentState::Idle
+            || terminal.effective_known_agent() != Some(crate::detect::Agent::Traex)
+            || terminal.pending_agent_resume_plan.is_some()
+        {
+            return agent_not_ready(id, &params.target);
+        }
+        let Some(session) = terminal.persisted_agent_session.as_ref() else {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "agent native session is unavailable",
+            );
+        };
+        if session.agent != "traex"
+            || session.session_ref.value != params.expected_session_id
+            || session.session_ref.kind != crate::agent_resume::AgentSessionRefKind::Id
+        {
+            return encode_error(
+                id,
+                "agent_session_changed",
+                "agent native session no longer matches the model prompt precondition",
+            );
+        }
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        if !super::super::agents::runtime_hosts_agent(runtime, crate::detect::Agent::Traex) {
+            return agent_not_ready(id, &params.target);
+        }
+        let Some(plan) =
+            crate::agent_resume::plan_traex_with_model(&session.session_ref, &params.model)
+        else {
+            return encode_error(id, "invalid_agent_prompt", "model is invalid");
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        terminal.prepare_agent_runtime_replacement(plan);
+        self.shutdown_terminal_runtime(terminal_id);
+        encode_success(id, ResponseResult::Ok {})
     }
 
     fn queue_agent_prompt(
         &mut self,
         id: String,
         params: AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<QueuedAgentPrompt, String> {
         if params.text.is_empty() {
             return Err(encode_error(
                 id,
@@ -226,7 +312,7 @@ impl App {
                 submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
-        Ok((id, agent, completion))
+        Ok((id, agent, params.submission_id, completion))
     }
 
     pub(super) fn handle_agent_read(
@@ -453,6 +539,75 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
+    #[tokio::test]
+    async fn model_prompt_replaces_the_exact_idle_traex_runtime_with_a_model_resume() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("primary".into());
+        terminal.set_detected_state(Some(Agent::Traex), AgentState::Idle);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("traex-session").unwrap(),
+        });
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 2,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: "model-prompt".into(),
+                method: crate::api::schema::Method::AgentPromptModel(
+                    crate::api::schema::AgentPromptModelParams {
+                        target: public_pane_id,
+                        text: "continue".into(),
+                        model: "gpt-5.4".into(),
+                        submission_id: "prompt-1".into(),
+                        expected_session_id: "traex-session".into(),
+                    },
+                ),
+            },
+            respond_to,
+        ));
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("model resume request responds after the old runtime is stopped");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.as_slice()),
+            Some(
+                ["traex", "resume", "traex-session", "--model", "gpt-5.4"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        assert!(terminal.respawn_shell_on_exit);
+        assert_eq!(terminal.agent_name.as_deref(), Some("primary"));
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("traex-session")
+        );
+        assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
     #[test]
     fn prompt_delay_only_scales_for_windows_codex() {
         let codex_delay = agent_prompt_submit_delay(Agent::Codex, 4_096);
@@ -501,9 +656,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission");
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::AgentPrompted { agent, .. } = success.result else {
+        let ResponseResult::AgentPrompted {
+            agent,
+            submission_id,
+        } = success.result
+        else {
             panic!("expected prompted response");
         };
+        assert_eq!(submission_id.as_deref(), Some("prompt-1"));
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
         assert_eq!(
             rx.try_recv().unwrap(),

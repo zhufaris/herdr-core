@@ -355,6 +355,18 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
                 .arg(
+                    option("submission-id", "ID")
+                        .help("Bind this accepted prompt to a caller-provided submission identity"),
+                )
+                .arg(
+                    option("expected-session-id", "ID")
+                        .help("Reject unless the target still has this exact agent session"),
+                )
+                .arg(
+                    option("model", "MODEL")
+                        .help("Submit through the target TraeX session using this exact model"),
+                )
+                .arg(
                     flag("wait")
                         .help("Wait for the first matching state observed after submission"),
                 )
@@ -1345,6 +1357,23 @@ mod tests {
         assert!(
             !leaf.contains(super::super::AGENT_HELP_FOOTER),
             "leaf help should stay focused: {leaf}"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_help_advertises_native_queue_identity_flags() {
+        let help = long_help(&["agent", "prompt"]);
+        assert!(
+            help.contains("--submission-id <ID>"),
+            "agent prompt help is missing submission identity: {help}"
+        );
+        assert!(
+            help.contains("--expected-session-id <ID>"),
+            "agent prompt help is missing the session fence: {help}"
+        );
+        assert!(
+            help.contains("--model <MODEL>"),
+            "agent prompt help is missing model-aware dispatch: {help}"
         );
     }
 

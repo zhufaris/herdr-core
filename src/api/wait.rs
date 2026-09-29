@@ -18,6 +18,7 @@ use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
+const AGENT_MODEL_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(super) fn wait_for_output(
     request_id: String,
@@ -182,6 +183,7 @@ pub(super) fn prompt_agent(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    let submission_id = params.submission_id.clone();
     let Some(wait) = params.wait.clone() else {
         return Ok(Some(dispatch_to_app_with_timeout(
             Request {
@@ -289,7 +291,7 @@ pub(super) fn prompt_agent(
         };
     }
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, submission_id).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -318,7 +320,80 @@ pub(super) fn prompt_agent(
         AgentWaitOutcome::Matched(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    agent_prompt_success(request_id, agent, submission_id).map(Some)
+}
+
+pub(super) fn prompt_agent_after_model_resume(
+    request_id: String,
+    params: crate::api::schema::AgentPromptModelParams,
+    expected_terminal_id: String,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    let deadline = std::time::Instant::now() + AGENT_MODEL_RESUME_TIMEOUT;
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+        let current = match agent_get(&request_id, &params.target, api_tx) {
+            Ok(agent) => agent,
+            Err(response) => return agent_wait_probe_error(response).map(Some),
+        };
+        if current.terminal_id != expected_terminal_id
+            || current
+                .agent_session
+                .as_ref()
+                .is_some_and(|session| session.value != params.expected_session_id)
+        {
+            return agent_wait_not_running(request_id).map(Some);
+        }
+        if model_resume_ready(&current, &expected_terminal_id, &params.expected_session_id) {
+            return prompt_agent(
+                request_id,
+                crate::api::schema::AgentPromptParams {
+                    target: params.target,
+                    text: params.text,
+                    submission_id: Some(params.submission_id),
+                    expected_session_id: Some(params.expected_session_id),
+                    wait: None,
+                },
+                stream,
+                api_tx,
+                event_hub,
+                running,
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            return serde_json::to_string(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "agent_model_resume_timeout".into(),
+                    message: "timed out waiting for the model-selected TraeX session".into(),
+                },
+            })
+            .map(Some)
+            .map_err(std::io::Error::other);
+        }
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+fn model_resume_ready(
+    agent: &crate::api::schema::AgentInfo,
+    expected_terminal_id: &str,
+    expected_session_id: &str,
+) -> bool {
+    agent.terminal_id == expected_terminal_id
+        && agent.agent.as_deref() == Some("traex")
+        && agent.agent_status == crate::api::schema::AgentStatus::Idle
+        && agent.interactive_ready
+        && agent.agent_session.as_ref().is_some_and(|session| {
+            session.agent == "traex"
+                && session.kind == crate::agent_resume::AgentSessionRefKind::Id
+                && session.value == expected_session_id
+        })
 }
 
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {
@@ -331,10 +406,14 @@ fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> O
 fn agent_prompt_success(
     request_id: String,
     agent: crate::api::schema::AgentInfo,
+    submission_id: Option<String>,
 ) -> std::io::Result<String> {
     serde_json::to_string(&SuccessResponse {
         id: request_id,
-        result: ResponseResult::AgentPrompted { agent },
+        result: ResponseResult::AgentPrompted {
+            agent,
+            submission_id,
+        },
     })
     .map_err(std::io::Error::other)
 }
@@ -824,6 +903,40 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_resume_ready_requires_exact_interactive_traex_session() {
+        let mut agent: crate::api::schema::AgentInfo = serde_json::from_value(serde_json::json!({
+            "terminal_id": "terminal-1",
+            "name": "primary",
+            "agent": "traex",
+            "agent_status": "idle",
+            "agent_session": {
+                "source": "herdr:traex",
+                "agent": "traex",
+                "kind": "id",
+                "value": "session-1"
+            },
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "pane_id": "pane-1",
+            "focused": true,
+            "interactive_ready": true,
+            "state_change_seq": 2,
+            "revision": 2
+        }))
+        .unwrap();
+
+        assert!(model_resume_ready(&agent, "terminal-1", "session-1"));
+        agent.interactive_ready = false;
+        assert!(!model_resume_ready(&agent, "terminal-1", "session-1"));
+        agent.interactive_ready = true;
+        agent.agent_status = crate::api::schema::AgentStatus::Working;
+        assert!(!model_resume_ready(&agent, "terminal-1", "session-1"));
+        agent.agent_status = crate::api::schema::AgentStatus::Idle;
+        agent.agent_session.as_mut().unwrap().value = "session-2".into();
+        assert!(!model_resume_ready(&agent, "terminal-1", "session-1"));
+    }
 
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {

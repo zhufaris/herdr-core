@@ -2091,6 +2091,28 @@ impl TerminalState {
         self.clear_agent_name();
     }
 
+    pub(crate) fn prepare_agent_runtime_replacement(
+        &mut self,
+        plan: crate::agent_resume::AgentResumePlan,
+    ) {
+        self.detected_agent = None;
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_observed_at = None;
+        self.hook_authority = None;
+        self.agent_metadata.clear();
+        self.metadata_report_agents.clear();
+        self.suppressed_full_lifecycle_hook_reports.clear();
+        self.stale_full_lifecycle_hook_sessions.clear();
+        self.state = AgentState::Unknown;
+        self.last_agent_state_change_seq = None;
+        self.launch_argv = None;
+        self.recent_agent_process_exit = None;
+        self.agent_process_acquisition_pending = false;
+        self.pending_agent_resume_plan = Some(plan);
+        self.respawn_shell_on_exit = true;
+    }
+
     pub fn is_agent_terminal(&self) -> bool {
         self.agent_name.is_some() || self.effective_agent_label().is_some()
     }

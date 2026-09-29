@@ -182,6 +182,27 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn model_prompt_request_uses_a_distinct_fail_closed_method() {
+    let prompt = Request {
+        id: "model-prompt".into(),
+        method: Method::AgentPromptModel(AgentPromptModelParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            model: "gpt-5.4".into(),
+            submission_id: "prompt-1".into(),
+            expected_session_id: "session-1".into(),
+        }),
+    };
+
+    let json = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(json["method"], "agent.prompt_model");
+    assert_eq!(json["params"]["model"], "gpt-5.4");
+    assert_eq!(json["params"]["submission_id"], "prompt-1");
+    assert_eq!(json["params"]["expected_session_id"], "session-1");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), prompt);
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {

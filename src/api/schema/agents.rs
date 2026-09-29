@@ -188,6 +188,15 @@ pub struct AgentPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptModelParams {
+    pub target: String,
+    pub text: String,
+    pub model: String,
+    pub submission_id: String,
+    pub expected_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

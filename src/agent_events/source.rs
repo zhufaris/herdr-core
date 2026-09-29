@@ -556,6 +556,44 @@ mod tests {
     }
 
     #[test]
+    fn skips_invalid_traex_records_without_failing_the_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-source-invalid-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let data = [
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"test\"}}",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn\"}}",
+            "{\"type\":\"event_msg\",\"payload\":{}}",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"answer\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"still readable\"}]}}",
+        ].join("\n") + "\n";
+        std::fs::write(&path, &data).unwrap();
+        let source = SourceReader::register(
+            "term".into(),
+            TranscriptKind::Traex,
+            "test".into(),
+            &path,
+            1,
+            std::slice::from_ref(&dir),
+        )
+        .unwrap();
+
+        let (checkpoint, events) = SourceReader::read(&source, &Checkpoint::default()).unwrap();
+
+        assert_eq!(checkpoint.offset, data.len() as u64);
+        assert!(events.iter().any(|event| {
+            matches!(&event.payload, ReplyPayload::RecordSkipped { code } if code == "invalid_record")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(&event.payload, ReplyPayload::Message { text, .. } if text == "still readable")
+        }));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn partial_lines_and_same_size_rewrite_do_not_advance_checkpoint() {
         let dir = std::env::temp_dir().join(format!(
             "herdr-source-{}-{}",

@@ -21,7 +21,8 @@ impl EventError {
     pub(crate) fn is_skippable_record(&self) -> bool {
         matches!(
             self.0,
-            "unsupported_record"
+            "invalid_record"
+                | "unsupported_record"
                 | "unsupported_response_item"
                 | "unsupported_history_mutation"
                 | "unsupported_message_role"

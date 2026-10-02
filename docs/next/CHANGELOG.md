@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+- Automation clients can request an exact native four-character lowercase base36 Pane token through `tab.create.v2` (`herdr tab create --token ... --expected-workspace-label ...`). The existing `tab.create` contract still allocates tokens automatically. `invalid_pane_token`, `pane_token_conflict`, `workspace_not_found`, and `workspace_label_mismatch` fail before a Pane is created. Servers advertise this contract as `tab_create_v2`.
+- Automation clients can atomically move and retoken an existing Pane with `pane.identity_reconcile.v1` (`herdr pane identity-reconcile`). Requests fence an operation ID plus the expected Pane, terminal, Workspace, and token against a target Workspace ID, expected label, and exact token. Successful receipts return `previous` and `current` identities with `applied` or `already_converged`; operation-ID replay returns the original receipt. Stable failures include `invalid_pane_token`, `pane_token_conflict`, `workspace_not_found`, `workspace_label_mismatch`, `stale_source_identity`, and `operation_id_reused`; journal or persistence ambiguity is reported as unavailable or uncertain without inventing a new identity. Servers advertise this contract as `pane_identity_reconcile_v1`.
+- Managed clients can rotate an Agent session in the same Pane and PTY through `agent.session_rotate.v1` (`herdr agent session-rotate`). Requests fence the operation ID, Pane, terminal, native session, idle state sequence, and managed launch. Results distinguish `rotated`, `already_applied`, `fence_lost`, `unsupported_launch`, `definitely_not_started`, `rotating`, and `uncertain`, and successful receipts return the old and new native session identities. Servers advertise this contract as `agent_session_rotation_v1`.
+
+### Fixed
+- The first exact same-Pane rotation of a legacy directly launched managed TraeX process can now bootstrap the durable session supervisor on supported Unix hosts. Core verifies the Pane, terminal, native session, process group, idle state, executable, and launch arguments; journals intent before stopping only that foreground job; and preserves the Pane, PTY, token, and terminal. Unsupported platforms or ambiguous process ownership fail without key injection, `/new`, Pane replacement, or an unfenced kill.
+
 ## [0.9.3] - 2026-09-29
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2

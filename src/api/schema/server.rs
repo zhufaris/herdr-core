@@ -27,4 +27,7 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// Whether this server exposes the path-free, cursor-based session event stream.
+    #[serde(default)]
+    pub session_event_stream_v1: bool,
 }

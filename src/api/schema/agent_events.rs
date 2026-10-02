@@ -33,6 +33,41 @@ pub struct AgentEventsSubmissionParams {
     pub submission_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventsOpenParams {
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventsReadParams {
+    pub stream_id: String,
+    #[serde(default = "start_cursor")]
+    pub after: String,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionEventStream {
+    pub stream_id: String,
+    pub terminal_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionEventsBatch {
+    pub stream_id: String,
+    pub events: Vec<AgentReplyEvent>,
+    pub next_cursor: String,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -91,6 +126,9 @@ pub struct AgentEventsTurnCursor {
 }
 fn default_limit() -> u32 {
     64
+}
+fn start_cursor() -> String {
+    "start".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

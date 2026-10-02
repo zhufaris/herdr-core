@@ -637,6 +637,10 @@ impl Journal {
     pub fn prune(&mut self) -> Result<()> {
         self.prune_to(MAX_EVENT_BYTES, now() - RETENTION_SECONDS)
     }
+    #[cfg(test)]
+    pub(crate) fn expire_all_for_test(&mut self) -> Result<()> {
+        self.prune_to(0, i64::MAX)
+    }
     fn prune_to(&mut self, max_bytes: i64, cutoff: i64) -> Result<()> {
         let tx = self.db.transaction()?;
         let expired: i64 = tx.query_row(

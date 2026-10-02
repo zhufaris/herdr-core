@@ -1315,6 +1315,18 @@
           ],
           "type": "object"
         },
+        "AgentEventsSubmissionParams": {
+          "additionalProperties": false,
+          "properties": {
+            "submission_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "submission_id"
+          ],
+          "type": "object"
+        },
         "AgentEventsTurnBoundary": {
           "enum": [
             "active",
@@ -4099,6 +4111,40 @@
           },
           "type": "object"
         },
+        "SessionEventsOpenParams": {
+          "additionalProperties": false,
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "SessionEventsReadParams": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "default": "start",
+              "type": "string"
+            },
+            "limit": {
+              "default": 64,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream_id"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -6337,11 +6383,75 @@
         {
           "properties": {
             "method": {
+              "const": "agent.events.submission",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsSubmissionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.events.subscribe",
               "type": "string"
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.events.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.events.read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.events.subscribe",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsReadParams"
             }
           },
           "required": [
@@ -6895,6 +7005,52 @@
             "latest_cursor"
           ],
           "type": "object"
+        },
+        "AgentEventsSubmissionReceipt": {
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+            },
+            "created_at": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
+            },
+            "submission_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "updated_at": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "submission_id",
+            "terminal_id",
+            "agent_kind",
+            "session_id",
+            "state",
+            "created_at",
+            "updated_at"
+          ],
+          "type": "object"
+        },
+        "AgentEventsSubmissionState": {
+          "enum": [
+            "prepared",
+            "accepted",
+            "rejected",
+            "uncertain"
+          ],
+          "type": "string"
         },
         "AgentInfo": {
           "properties": {
@@ -10061,6 +10217,16 @@
                     "null"
                   ]
                 },
+                "submission_receipt": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionReceipt"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -10195,6 +10361,119 @@
                 "source_id",
                 "found",
                 "after_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_kind": {
+                  "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+                },
+                "created_at": {
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
+                },
+                "submission_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_events_submission_receipt",
+                  "type": "string"
+                },
+                "updated_at": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "type",
+                "submission_id",
+                "terminal_id",
+                "agent_kind",
+                "session_id",
+                "state",
+                "created_at",
+                "updated_at"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_kind": {
+                  "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+                },
+                "earliest_cursor": {
+                  "type": "string"
+                },
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "terminal_id",
+                "agent_kind",
+                "session_id",
+                "earliest_cursor",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "earliest_cursor": {
+                  "type": "string"
+                },
+                "events": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentReplyEvent"
+                  },
+                  "type": "array"
+                },
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "next_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_batch",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "events",
+                "next_cursor",
+                "earliest_cursor",
+                "latest_cursor"
               ],
               "type": "object"
             },
@@ -11209,6 +11488,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "session_event_stream_v1": {
+              "default": false,
+              "description": "Whether this server exposes the path-free, cursor-based session event stream.",
               "type": "boolean"
             },
             "surface_interest": {

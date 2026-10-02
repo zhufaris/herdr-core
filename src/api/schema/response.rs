@@ -132,6 +132,14 @@ pub enum ResponseResult {
         #[serde(flatten)]
         receipt: super::agent_events::AgentEventsSubmissionReceipt,
     },
+    SessionEventsOpened {
+        #[serde(flatten)]
+        stream: super::agent_events::SessionEventStream,
+    },
+    SessionEventsBatch {
+        #[serde(flatten)]
+        batch: super::agent_events::SessionEventsBatch,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

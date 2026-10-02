@@ -74,6 +74,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        session_event_stream_v1: true,
     })
 }
 
@@ -231,6 +232,41 @@ fn handle_connection_with_events(
                 &agent_events::failure(&request_id, "events_unavailable"),
             ),
         },
+        Method::SessionEventsSubscribe(params) => match reply_streams {
+            Some(service) => service.subscribe_session(stream, request_id, params, running),
+            None => write_json_line_allow_disconnect(
+                &mut stream,
+                &agent_events::failure(&request_id, "events_unavailable"),
+            ),
+        },
+        Method::SessionEventsOpen(_) | Method::SessionEventsRead(_) => {
+            let stream_id = match &request.method {
+                Method::SessionEventsRead(params) => Some(params.stream_id.clone()),
+                _ => None,
+            };
+            let result = match reply_streams {
+                Some(service) => match request.method {
+                    Method::SessionEventsOpen(params) => service
+                        .open_session(&params, api_tx)
+                        .map(|stream| ResponseResult::SessionEventsOpened { stream }),
+                    Method::SessionEventsRead(params) => service
+                        .read_session(&params)
+                        .map(|batch| ResponseResult::SessionEventsBatch { batch }),
+                    _ => unreachable!("session event method group is exhaustive"),
+                },
+                None => Err(crate::agent_events::EventError("events_unavailable")),
+            };
+            let response = match result {
+                Ok(result) => serde_json::json!({"id":request_id,"result":result}),
+                Err(error) => match (reply_streams, stream_id) {
+                    (Some(service), Some(stream_id)) => {
+                        service.read_failure(&request_id, error.0, &stream_id)
+                    }
+                    _ => agent_events::failure(&request_id, error.0),
+                },
+            };
+            write_json_line_allow_disconnect(&mut stream, &response)
+        }
         Method::AgentEventsAttach(_)
         | Method::AgentEventsSources(_)
         | Method::AgentEventsRead(_)
@@ -734,6 +770,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentEventsLocate(_) => "agent.events.locate",
         Method::AgentEventsSubmission(_) => "agent.events.submission",
         Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
+        Method::SessionEventsOpen(_) => "session.events.open",
+        Method::SessionEventsRead(_) => "session.events.read",
+        Method::SessionEventsSubscribe(_) => "session.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
@@ -1542,6 +1581,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                session_event_stream_v1: true,
             }),
             None,
             None,
@@ -1550,6 +1590,15 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn default_capabilities_advertise_the_session_event_stream() {
+        assert!(
+            default_capabilities()
+                .expect("default server capabilities")
+                .session_event_stream_v1
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::api::schema::agent_events::{
     AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsLocateParams, AgentEventsReadParams,
-    AgentEventsSubmissionParams, AgentEventsTurnBoundary, TranscriptKind,
+    AgentEventsSubmissionParams, AgentEventsTurnBoundary, SessionEventsOpenParams,
+    SessionEventsReadParams, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -114,13 +115,49 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
                 submission_id: submission_id.into(),
             })
         }
+        "stream-open" => {
+            if values.keys().any(|key| !["--pane"].contains(key)) {
+                return help();
+            }
+            let Some(pane_id) = get("--pane") else {
+                return help();
+            };
+            Method::SessionEventsOpen(SessionEventsOpenParams {
+                pane_id: pane_id.into(),
+            })
+        }
+        "stream-read" | "stream-subscribe" => {
+            if values
+                .keys()
+                .any(|key| !["--stream", "--after", "--limit"].contains(key))
+            {
+                return help();
+            }
+            let Some(stream_id) = get("--stream") else {
+                return help();
+            };
+            let limit = match get("--limit").unwrap_or("64").parse::<u32>() {
+                Ok(value) if (1..=128).contains(&value) => value,
+                _ => return help(),
+            };
+            let params = SessionEventsReadParams {
+                stream_id: stream_id.into(),
+                after: get("--after").unwrap_or("start").into(),
+                limit,
+            };
+            if action == "stream-read" {
+                Method::SessionEventsRead(params)
+            } else {
+                Method::SessionEventsSubscribe(params)
+            }
+        }
         _ => return help(),
     };
     let request = Request {
         id: format!("cli:agent:events:{action}"),
         method,
     };
-    if action != "subscribe" {
+    if !matches!(action, "subscribe" | "stream-subscribe") {
         return super::print_response(&super::send_request(&request)?);
     }
     let mut stream = crate::ipc::connect_local_stream(&crate::api::socket_path())?;
@@ -144,6 +181,6 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     }
 }
 fn help() -> std::io::Result<i32> {
-    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events submission --submission-id ID\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
+    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events submission --submission-id ID\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]\nherdr agent events stream-open --pane ID\nherdr agent events stream-read|stream-subscribe --stream ID [--after start|latest|CURSOR] [--limit 1..128]");
     Ok(2)
 }

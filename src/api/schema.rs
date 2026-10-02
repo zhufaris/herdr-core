@@ -245,6 +245,12 @@ pub enum Method {
     AgentEventsSubmission(agent_events::AgentEventsSubmissionParams),
     #[serde(rename = "agent.events.subscribe")]
     AgentEventsSubscribe(agent_events::AgentEventsReadParams),
+    #[serde(rename = "session.events.open")]
+    SessionEventsOpen(agent_events::SessionEventsOpenParams),
+    #[serde(rename = "session.events.read")]
+    SessionEventsRead(agent_events::SessionEventsReadParams),
+    #[serde(rename = "session.events.subscribe")]
+    SessionEventsSubscribe(agent_events::SessionEventsReadParams),
     #[serde(rename = "events.subscribe")]
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]

@@ -33,6 +33,41 @@ pub(crate) struct Checkpoint {
 pub(crate) struct SourceReader;
 
 impl SourceReader {
+    pub(crate) fn register_path_session(
+        terminal_id: String,
+        kind: TranscriptKind,
+        path: &Path,
+        foreground_pid: u32,
+        roots: &[PathBuf],
+    ) -> Result<RegisteredSource> {
+        let path = path.canonicalize()?;
+        if !roots
+            .iter()
+            .filter_map(|candidate| candidate.canonicalize().ok())
+            .any(|root| path.starts_with(root))
+        {
+            return Err(EventError("source_path_not_allowed"));
+        }
+        let mut file = open_regular(&path)?;
+        let line = match read_line(&mut file)? {
+            ReadLine::Complete(line) => line,
+            ReadLine::Incomplete => return Err(EventError("incomplete_session_header")),
+            ReadLine::OversizedComplete { .. } => return Err(EventError("record_too_large")),
+        };
+        let header: Value = serde_json::from_slice(&line)?;
+        let session_id = match kind {
+            TranscriptKind::Traex if header["type"] == "session_meta" => {
+                header["payload"]["id"].as_str()
+            }
+            TranscriptKind::Pi if header["type"] == "session" => header["id"].as_str(),
+            _ => None,
+        }
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or(EventError("session_identity_missing"))?
+        .to_owned();
+        Self::register(terminal_id, kind, session_id, &path, foreground_pid, roots)
+    }
+
     pub(crate) fn checkpoint_at_end(source: &RegisteredSource) -> Result<Checkpoint> {
         let mut file = open_regular(&source.path)?;
         let length = file.metadata()?.len();

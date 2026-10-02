@@ -328,6 +328,14 @@ fn agent_command() -> Command {
                 .about(if name == "read" { "Read a bounded batch after a source cursor" } else { "Replay and follow durable reply events as JSONL" })
                 .arg(option("source", "ID").required(true))
                 .arg(option("after", "CURSOR"))
+                .arg(option("limit", "N"))))
+            .subcommand(Command::new("stream-open")
+                .about("Open a path-free durable stream for the Pane's active Agent session")
+                .arg(option("pane", "ID").required(true)))
+            .subcommands(["stream-read", "stream-subscribe"].map(|name| Command::new(name)
+                .about(if name == "stream-read" { "Read a bounded batch after a session cursor" } else { "Replay and follow durable session events as JSONL" })
+                .arg(option("stream", "ID").required(true))
+                .arg(option("after", "CURSOR"))
                 .arg(option("limit", "N")))))
         .subcommand(Command::new("list").about("List agents"))
         .subcommand(id_command("get", "target", "Show an agent"))
@@ -1328,6 +1336,21 @@ mod tests {
         let cmd = super::command();
         let attach = command_path(&cmd, &["agent", "events", "attach"]);
         assert_eq!(option_values(attach, "from"), ["start", "end"]);
+    }
+
+    #[test]
+    fn spec_models_path_free_session_event_stream_commands() {
+        let cmd = super::command();
+        let open = command_path(&cmd, &["agent", "events", "stream-open"]);
+        assert!(has_option(open, "pane"));
+        assert!(!has_option(open, "path"));
+
+        for action in ["stream-read", "stream-subscribe"] {
+            let command = command_path(&cmd, &["agent", "events", action]);
+            assert!(has_option(command, "stream"));
+            assert!(has_option(command, "after"));
+            assert!(has_option(command, "limit"));
+        }
     }
 
     fn long_help(path: &[&str]) -> String {

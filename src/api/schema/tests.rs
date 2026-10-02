@@ -777,6 +777,7 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                session_event_stream_v1: true,
             }),
         },
     };
@@ -1583,6 +1584,83 @@ fn agent_events_submission_receipt_has_a_stable_public_shape() {
             "state": "accepted",
             "created_at": 10,
             "updated_at": 11
+        })
+    );
+}
+
+#[test]
+fn session_event_stream_contract_is_path_free_and_cursor_bounded() {
+    let open: Request = serde_json::from_value(serde_json::json!({
+        "id": "stream-open",
+        "method": "session.events.open",
+        "params": { "pane_id": "w1:p1" }
+    }))
+    .unwrap();
+    let Method::SessionEventsOpen(params) = open.method else {
+        panic!("expected session.events.open");
+    };
+    assert_eq!(params.pane_id, "w1:p1");
+
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "id": "stream-open-with-path",
+        "method": "session.events.open",
+        "params": { "pane_id": "w1:p1", "path": "/tmp/session.jsonl" }
+    }))
+    .is_err());
+
+    let read: Request = serde_json::from_value(serde_json::json!({
+        "id": "stream-read",
+        "method": "session.events.read",
+        "params": { "stream_id": "epoch-1", "after": "cursor-1", "limit": 64 }
+    }))
+    .unwrap();
+    let Method::SessionEventsRead(params) = read.method else {
+        panic!("expected session.events.read");
+    };
+    assert_eq!(params.stream_id, "epoch-1");
+    assert_eq!(params.limit, 64);
+
+    let opened = ResponseResult::SessionEventsOpened {
+        stream: agent_events::SessionEventStream {
+            stream_id: "epoch-1".into(),
+            terminal_id: "terminal-1".into(),
+            agent_kind: agent_events::TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            earliest_cursor: "cursor-0".into(),
+            latest_cursor: "cursor-9".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(opened).unwrap(),
+        serde_json::json!({
+            "type": "session_events_opened",
+            "stream_id": "epoch-1",
+            "terminal_id": "terminal-1",
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "earliest_cursor": "cursor-0",
+            "latest_cursor": "cursor-9"
+        })
+    );
+
+    let batch = ResponseResult::SessionEventsBatch {
+        batch: agent_events::SessionEventsBatch {
+            stream_id: "epoch-1".into(),
+            events: vec![],
+            next_cursor: "cursor-4".into(),
+            earliest_cursor: "cursor-2".into(),
+            latest_cursor: "cursor-9".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(batch).unwrap(),
+        serde_json::json!({
+            "type": "session_events_batch",
+            "stream_id": "epoch-1",
+            "events": [],
+            "next_cursor": "cursor-4",
+            "earliest_cursor": "cursor-2",
+            "latest_cursor": "cursor-9"
         })
     );
 }

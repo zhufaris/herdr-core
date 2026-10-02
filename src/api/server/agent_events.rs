@@ -1,13 +1,12 @@
 use super::{dispatch_to_app_with_timeout, write_json_line_allow_disconnect};
-#[cfg(test)]
-use crate::agent_events::Checkpoint;
 use crate::agent_events::{
-    EventError, Journal, RegisteredSource, SourceReader, SubmissionPrepareResult,
+    Checkpoint, EventError, Journal, RegisteredSource, SourceReader, SubmissionPrepareResult,
 };
 use crate::api::schema::agent_events::{
     AgentEventsAttachParams, AgentEventsBatch, AgentEventsLocateParams, AgentEventsReadParams,
     AgentEventsSubmissionParams, AgentEventsSubmissionReceipt, AgentEventsSubmissionState,
-    AgentEventsTurnCursor, TranscriptKind,
+    AgentEventsTurnCursor, SessionEventStream, SessionEventsBatch, SessionEventsOpenParams,
+    SessionEventsReadParams, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, PaneProcessInfoParams, Request, ResponseResult};
 use crate::api::ApiRequestSender;
@@ -17,6 +16,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
 
 pub(super) struct ReplyStreams {
     journal: Mutex<Option<Journal>>,
@@ -162,6 +163,64 @@ impl ReplyStreams {
         }
     }
 
+    pub fn open_session(
+        &self,
+        params: &SessionEventsOpenParams,
+        api_tx: &ApiRequestSender,
+    ) -> crate::agent_events::Result<SessionEventStream> {
+        let snapshot = request_snapshot(api_tx)?;
+        let pane = snapshot["panes"]
+            .as_array()
+            .and_then(|panes| panes.iter().find(|pane| pane["pane_id"] == params.pane_id))
+            .ok_or(EventError("pane_not_found"))?;
+        let terminal_id = pane["terminal_id"]
+            .as_str()
+            .ok_or(EventError("terminal_identity_missing"))?;
+        let session = pane["agent_session"]
+            .as_object()
+            .ok_or(EventError("session_identity_missing"))?;
+        let kind = match session.get("agent").and_then(Value::as_str) {
+            Some("traex") => TranscriptKind::Traex,
+            Some("pi") => TranscriptKind::Pi,
+            _ => return Err(EventError("agent_kind_mismatch")),
+        };
+        let session_kind = session
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or(EventError("session_identity_missing"))?;
+        let session_value = session
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or(EventError("session_identity_missing"))?;
+        let foreground_pid = foreground_pid(api_tx, &params.pane_id, kind)?;
+        let roots = source_roots(kind);
+        let source = match session_kind {
+            "path" => SourceReader::register_path_session(
+                terminal_id.to_owned(),
+                kind,
+                std::path::Path::new(session_value),
+                foreground_pid,
+                &roots,
+            )?,
+            "id" => {
+                discover_session_source(terminal_id, kind, session_value, foreground_pid, &roots)?
+            }
+            _ => return Err(EventError("session_identity_missing")),
+        };
+        self.with_journal(true, |journal| {
+            journal.attach(&source, &Checkpoint::default())?;
+            let batch = journal.read(&source.id, "latest", 1)?;
+            Ok(SessionEventStream {
+                stream_id: source.id.clone(),
+                terminal_id: source.terminal_id.clone(),
+                agent_kind: source.kind,
+                session_id: source.session_id.clone(),
+                earliest_cursor: batch.earliest_cursor,
+                latest_cursor: batch.latest_cursor,
+            })
+        })
+    }
+
     pub fn prepare_submission(
         &self,
         params: &crate::api::schema::AgentPromptParams,
@@ -233,6 +292,21 @@ impl ReplyStreams {
     ) -> crate::agent_events::Result<AgentEventsBatch> {
         self.with_journal(false, |j| {
             j.read(&params.source_id, &params.after, params.limit)
+        })
+    }
+    pub fn read_session(
+        &self,
+        params: &SessionEventsReadParams,
+    ) -> crate::agent_events::Result<SessionEventsBatch> {
+        self.with_journal(false, |journal| {
+            let batch = journal.read(&params.stream_id, &params.after, params.limit)?;
+            Ok(SessionEventsBatch {
+                stream_id: params.stream_id.clone(),
+                events: batch.events,
+                next_cursor: batch.next_cursor,
+                earliest_cursor: batch.earliest_cursor,
+                latest_cursor: batch.latest_cursor,
+            })
         })
     }
     pub fn locate(
@@ -404,6 +478,73 @@ impl ReplyStreams {
         }
         Ok(())
     }
+
+    pub fn subscribe_session(
+        &self,
+        mut stream: LocalStream,
+        id: String,
+        mut params: SessionEventsReadParams,
+        running: &AtomicBool,
+    ) -> std::io::Result<()> {
+        let admitted = self
+            .subscribers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 32).then_some(count + 1)
+            })
+            .is_ok();
+        if !admitted {
+            return write_json_line_allow_disconnect(
+                &mut stream,
+                &failure(&id, "subscriber_limit"),
+            );
+        }
+        let _permit = SubscriberPermit(&self.subscribers);
+        let mut first = true;
+        while running.load(Ordering::Acquire) && !local_stream_peer_closed(&mut stream)? {
+            let observed = *self
+                .revision
+                .lock()
+                .map_err(|_| std::io::Error::other("event notifier unavailable"))?;
+            match self.read_session(&params) {
+                Ok(batch) => {
+                    params.after = batch.next_cursor.clone();
+                    if first {
+                        write_json_line_allow_disconnect(
+                            &mut stream,
+                            &json!({"id":id,"result":ResponseResult::SessionEventsBatch { batch: batch.clone() }}),
+                        )?;
+                        first = false;
+                    } else if !batch.events.is_empty() {
+                        write_json_line_allow_disconnect(
+                            &mut stream,
+                            &json!({"event":"session.events.batch","data":batch}),
+                        )?;
+                    }
+                    if params.after != batch.latest_cursor {
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    write_json_line_allow_disconnect(
+                        &mut stream,
+                        &self.read_failure(&id, error.0, &params.stream_id),
+                    )?;
+                    break;
+                }
+            }
+            let revision = self
+                .revision
+                .lock()
+                .map_err(|_| std::io::Error::other("event notifier unavailable"))?;
+            let _wait = self
+                .changed
+                .wait_timeout_while(revision, Duration::from_secs(1), |current| {
+                    *current == observed
+                })
+                .map_err(|_| std::io::Error::other("event notifier unavailable"))?;
+        }
+        Ok(())
+    }
 }
 
 fn agent_name(kind: TranscriptKind) -> &'static str {
@@ -514,6 +655,74 @@ fn source_roots(kind: TranscriptKind) -> Vec<PathBuf> {
     }
     roots
 }
+
+fn discover_session_source(
+    terminal_id: &str,
+    kind: TranscriptKind,
+    session_id: &str,
+    foreground_pid: u32,
+    roots: &[PathBuf],
+) -> crate::agent_events::Result<RegisteredSource> {
+    if session_id.is_empty() || session_id.len() > 512 || session_id.contains(['/', '\\']) {
+        return Err(EventError("invalid_session_id"));
+    }
+    let suffix = match kind {
+        TranscriptKind::Traex => format!("-{session_id}.jsonl"),
+        TranscriptKind::Pi => format!("_{session_id}.jsonl"),
+    };
+    let mut directories: Vec<PathBuf> = roots.to_vec();
+    let mut visited_directories = std::collections::HashSet::new();
+    let mut visited = 0usize;
+    let mut match_source = None;
+    while let Some(directory) = directories.pop() {
+        let directory = match directory.canonicalize() {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(EventError("source_io_error")),
+        };
+        if !visited_directories.insert(directory.clone()) {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => return Err(EventError("source_io_error")),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| EventError("source_io_error"))?;
+            visited += 1;
+            if visited > MAX_SESSION_DISCOVERY_ENTRIES {
+                return Err(EventError("session_source_scan_limit"));
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|_| EventError("source_io_error"))?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file()
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(&suffix))
+            {
+                continue;
+            }
+            let source = SourceReader::register(
+                terminal_id.to_owned(),
+                kind,
+                session_id.to_owned(),
+                &entry.path(),
+                foreground_pid,
+                roots,
+            )?;
+            if match_source.replace(source).is_some() {
+                return Err(EventError("ambiguous_session_source"));
+            }
+        }
+    }
+    match_source.ok_or(EventError("session_source_not_found"))
+}
 pub(super) fn failure(id: &str, code: &str) -> Value {
     json!({"id":id,"error":{"code":code,"message":code}})
 }
@@ -522,7 +731,307 @@ pub(super) fn failure(id: &str, code: &str) -> Value {
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::OnceLock;
+    use tokio::sync::mpsc;
+
+    fn session_stream_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn session_stream_round_trip(
+        service: &ReplyStreams,
+        api_tx: &ApiRequestSender,
+        running: &Arc<AtomicBool>,
+        root: &std::path::Path,
+        request: Value,
+    ) -> Value {
+        let socket = root.join(format!(
+            "request-{}-{}.sock",
+            request["id"].as_str().unwrap(),
+            crate::agent_events::now()
+        ));
+        let listener = crate::ipc::bind_local_listener(&socket).unwrap();
+        let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
+        let server = listener.accept().unwrap();
+        writeln!(client, "{request}").unwrap();
+        client.flush().unwrap();
+
+        super::super::handle_connection_with_events(
+            server,
+            api_tx,
+            &crate::api::EventHub::default(),
+            running,
+            None,
+            None,
+            Some(service),
+        )
+        .unwrap();
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn session_event_socket_opens_without_a_path_and_reports_expired_cursor_bounds() {
+        let _guard = session_stream_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-session-stream-{}-{}",
+            std::process::id(),
+            crate::agent_events::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}\n"
+            ),
+        )
+        .unwrap();
+        let previous_root = std::env::var_os("HERDR_TRAEX_TRANSCRIPT_ROOT");
+        std::env::set_var("HERDR_TRAEX_TRANSCRIPT_ROOT", &root);
+
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let transcript_for_runtime = transcript.clone();
+        let session_current = Arc::new(AtomicBool::new(true));
+        let responder_session_current = session_current.clone();
+        let responder = std::thread::spawn(move || {
+            while let Some(message) = api_rx.blocking_recv() {
+                let result = match message.request.method {
+                    Method::SessionSnapshot(_) => {
+                        let agent_session =
+                            responder_session_current.load(Ordering::Acquire).then(|| {
+                                json!({
+                                    "agent": "traex",
+                                    "kind": "path",
+                                    "value": transcript_for_runtime
+                                })
+                            });
+                        json!({
+                            "id": message.request.id,
+                            "result": {
+                                "type": "session_snapshot",
+                                "snapshot": {"panes": [{
+                                    "pane_id": "pane-1",
+                                    "terminal_id": "terminal-1",
+                                    "agent_session": agent_session
+                                }]}
+                            }
+                        })
+                    }
+                    Method::PaneProcessInfo(_) => json!({
+                        "id": message.request.id,
+                        "result": {
+                            "type": "pane_process_info",
+                            "process_info": {
+                                "shell_pid": 10,
+                                "foreground_process_group_id": 20,
+                                "foreground_processes": [{
+                                    "name": "traex",
+                                    "argv": ["traex"]
+                                }]
+                            }
+                        }
+                    }),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                message.respond_to.send(result.to_string()).unwrap();
+            }
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let service = Arc::new(ReplyStreams {
+            journal: Mutex::new(None),
+            directory: root.join("events"),
+            subscribers: AtomicUsize::new(0),
+            running: running.clone(),
+            revision: Mutex::new(0),
+            changed: Condvar::new(),
+        });
+
+        let opened = session_stream_round_trip(
+            &service,
+            &api_tx,
+            &running,
+            &root,
+            json!({
+                "id": "open",
+                "method": "session.events.open",
+                "params": {"pane_id": "pane-1"}
+            }),
+        );
+        let stream_id = opened["result"]["stream_id"]
+            .as_str()
+            .expect("open returns stream id")
+            .to_owned();
+        assert_eq!(opened["result"]["type"], "session_events_opened");
+        assert!(opened["result"].get("path").is_none());
+        assert!(!opened.to_string().contains(transcript.to_str().unwrap()));
+
+        service.collect(&api_tx, false).unwrap();
+        let first_batch = session_stream_round_trip(
+            &service,
+            &api_tx,
+            &running,
+            &root,
+            json!({
+                "id": "read",
+                "method": "session.events.read",
+                "params": {"stream_id": stream_id, "after": "start", "limit": 64}
+            }),
+        );
+        assert_eq!(first_batch["result"]["type"], "session_events_batch");
+        assert_eq!(first_batch["result"]["stream_id"], stream_id);
+        assert!(!first_batch["result"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        service
+            .with_journal(false, |journal| journal.expire_all_for_test())
+            .unwrap();
+        let expired = session_stream_round_trip(
+            &service,
+            &api_tx,
+            &running,
+            &root,
+            json!({
+                "id": "expired",
+                "method": "session.events.read",
+                "params": {"stream_id": stream_id, "after": "start", "limit": 64}
+            }),
+        );
+        assert_eq!(expired["error"]["code"], "cursor_expired");
+        assert!(expired["error"]["earliest_cursor"].is_string());
+        assert!(expired["error"]["latest_cursor"].is_string());
+
+        let stale_pane = session_stream_round_trip(
+            &service,
+            &api_tx,
+            &running,
+            &root,
+            json!({
+                "id": "stale-pane",
+                "method": "session.events.open",
+                "params": {"pane_id": "missing-pane"}
+            }),
+        );
+        assert_eq!(stale_pane["error"]["code"], "pane_not_found");
+
+        session_current.store(false, Ordering::Release);
+        let stale_session = session_stream_round_trip(
+            &service,
+            &api_tx,
+            &running,
+            &root,
+            json!({
+                "id": "stale-session",
+                "method": "session.events.open",
+                "params": {"pane_id": "pane-1"}
+            }),
+        );
+        assert_eq!(stale_session["error"]["code"], "session_identity_missing");
+
+        let subscription_socket = root.join("subscribe.sock");
+        let listener = crate::ipc::bind_local_listener(&subscription_socket).unwrap();
+        let mut client = crate::ipc::connect_local_stream(&subscription_socket).unwrap();
+        let server = listener.accept().unwrap();
+        writeln!(
+            client,
+            "{}",
+            json!({
+                "id": "subscribe",
+                "method": "session.events.subscribe",
+                "params": {"stream_id": stream_id, "after": "latest", "limit": 64}
+            })
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let subscriber_service = service.clone();
+        let subscriber_api_tx = api_tx.clone();
+        let subscriber_running = running.clone();
+        let subscriber = std::thread::spawn(move || {
+            super::super::handle_connection_with_events(
+                server,
+                &subscriber_api_tx,
+                &crate::api::EventHub::default(),
+                &subscriber_running,
+                None,
+                None,
+                Some(&subscriber_service),
+            )
+            .unwrap();
+        });
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        let subscribed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(subscribed["result"]["type"], "session_events_batch");
+        assert_eq!(subscribed["result"]["stream_id"], stream_id);
+
+        running.store(false, Ordering::Release);
+        service.notify();
+        subscriber.join().unwrap();
+        drop(service);
+        drop(api_tx);
+        responder.join().unwrap();
+        match previous_root {
+            Some(value) => std::env::set_var("HERDR_TRAEX_TRANSCRIPT_ROOT", value),
+            None => std::env::remove_var("HERDR_TRAEX_TRANSCRIPT_ROOT"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_free_discovery_finds_one_valid_session_and_rejects_ambiguity() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-session-discovery-{}-{}",
+            std::process::id(),
+            crate::agent_events::now()
+        ));
+        let nested = root.join("2026/10/02");
+        std::fs::create_dir_all(&nested).unwrap();
+        let transcript = nested.join("rollout-session-1.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n",
+        )
+        .unwrap();
+
+        let source = discover_session_source(
+            "terminal-1",
+            TranscriptKind::Traex,
+            "session-1",
+            10,
+            &[root.clone(), root.clone()],
+        )
+        .unwrap();
+        assert_eq!(source.session_id, "session-1");
+        assert_eq!(source.path, transcript.canonicalize().unwrap());
+
+        std::fs::write(
+            root.join("duplicate-session-1.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            discover_session_source(
+                "terminal-1",
+                TranscriptKind::Traex,
+                "session-1",
+                10,
+                std::slice::from_ref(&root),
+            )
+            .unwrap_err()
+            .0,
+            "ambiguous_session_source"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn agent_events_foreground_rejects_shell_and_mismatched_agent() {

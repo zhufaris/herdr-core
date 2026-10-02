@@ -3746,6 +3746,10 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
+    pub(crate) fn test_set_child_pid(&self, child_pid: u32) {
+        self.child_pid.store(child_pid, Ordering::Release);
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         let mut core = self.terminal.ghostty.core.lock().unwrap();

@@ -601,6 +601,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_set_child_pid(&self, child_pid: u32) {
+        self.0.test_set_child_pid(child_pid);
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         self.0.test_enable_kitty_source_forwarding();

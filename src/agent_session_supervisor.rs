@@ -278,6 +278,12 @@ fn journal_path(terminal_id: &str) -> PathBuf {
     endpoint_path(terminal_id).with_extension("json")
 }
 
+#[cfg(test)]
+pub(crate) fn remove_test_artifacts(terminal_id: &str) {
+    let _ = std::fs::remove_file(endpoint_path(terminal_id));
+    let _ = std::fs::remove_file(journal_path(terminal_id));
+}
+
 pub(crate) fn request_rotation(
     request: &SupervisorRotationRequest,
 ) -> io::Result<SupervisorRotationResponse> {
@@ -301,6 +307,39 @@ pub(crate) fn query_rotation(
                 Ok(response)
             }
         }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_legacy_bootstrap(
+    request: &SupervisorRotationRequest,
+) -> io::Result<SupervisorRotationResponse> {
+    let mut journal = SupervisorJournal::open(journal_path(&request.terminal_id))?;
+    Ok(match journal.begin(request)? {
+        SupervisorOperationState::New => SupervisorRotationResponse::Unknown,
+        SupervisorOperationState::Pending => SupervisorRotationResponse::Pending,
+        SupervisorOperationState::Launched => SupervisorRotationResponse::AlreadyApplied,
+        SupervisorOperationState::Conflict => SupervisorRotationResponse::Conflict,
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn record_legacy_bootstrap_result(
+    request: &SupervisorRotationRequest,
+    result: SupervisorRotationResponse,
+) -> io::Result<()> {
+    let mut journal = SupervisorJournal::open(journal_path(&request.terminal_id))?;
+    match journal.begin(request)? {
+        SupervisorOperationState::Pending => journal.mark_result(&request.operation_id, result),
+        SupervisorOperationState::Conflict => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "supervisor operation ID belongs to a different request",
+        )),
+        SupervisorOperationState::New => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor operation was not prepared before recording a result",
+        )),
+        SupervisorOperationState::Launched => Ok(()),
     }
 }
 
@@ -355,7 +394,7 @@ pub(crate) fn complete_rotation(
 }
 
 pub(crate) fn run_from_args(args: &[String]) -> io::Result<()> {
-    let (pane_id, terminal_id, initial_argv) = parse_args(args)?;
+    let (pane_id, terminal_id, bootstrap_operation, initial_argv) = parse_args(args)?;
     let endpoint = endpoint_path(&terminal_id);
     crate::ipc::prepare_socket_path(&endpoint, |path| {
         format!("agent supervisor is already running at {}", path.display())
@@ -364,7 +403,44 @@ pub(crate) fn run_from_args(args: &[String]) -> io::Result<()> {
     crate::ipc::restrict_socket_permissions(&endpoint, 0o600)?;
     let _socket_guard = SocketPathGuard(endpoint);
     let mut journal = SupervisorJournal::open(journal_path(&terminal_id))?;
-    let mut child = spawn_agent_child(&initial_argv)?;
+    if let Some(operation_id) = bootstrap_operation.as_deref() {
+        let Some(operation) = journal.persisted.operations.get(operation_id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "legacy bootstrap operation is missing",
+            ));
+        };
+        if operation.state != PersistedSupervisorOperationState::Accepted
+            || operation.request.pane_id != pane_id
+            || operation.request.terminal_id != terminal_id
+            || operation.request.launch_argv != initial_argv
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy bootstrap operation does not match the supervisor launch",
+            ));
+        }
+    }
+    let mut child = match spawn_agent_child(&initial_argv) {
+        Ok(child) => child,
+        Err(err) => {
+            if let Some(operation_id) = bootstrap_operation.as_deref() {
+                let _ = journal.mark_result(
+                    operation_id,
+                    SupervisorRotationResponse::Uncertain {
+                        reason: format!("replacement_launch_failed:{err}"),
+                    },
+                );
+            }
+            return Err(err);
+        }
+    };
+    if let Some(operation_id) = bootstrap_operation.as_deref() {
+        if let Err(err) = journal.mark_launched(operation_id) {
+            let _ = stop_agent_child(&mut child);
+            return Err(err);
+        }
+    }
 
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -411,7 +487,7 @@ pub(crate) fn run_from_args(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> io::Result<(String, String, Vec<String>)> {
+fn parse_args(args: &[String]) -> io::Result<(String, String, Option<String>, Vec<String>)> {
     let separator = args.iter().position(|arg| arg == "--").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -421,11 +497,13 @@ fn parse_args(args: &[String]) -> io::Result<(String, String, Vec<String>)> {
     let options = &args[..separator];
     let mut pane_id = None;
     let mut terminal_id = None;
+    let mut bootstrap_operation = None;
     let mut index = 0;
     while index < options.len() {
         let target = match options[index].as_str() {
             "--pane-id" => &mut pane_id,
             "--terminal-id" => &mut terminal_id,
+            "--bootstrap-operation" => &mut bootstrap_operation,
             option => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -453,7 +531,41 @@ fn parse_args(args: &[String]) -> io::Result<(String, String, Vec<String>)> {
         pane_id.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing pane ID"))?,
         terminal_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing terminal ID"))?,
+        bootstrap_operation,
         initial_argv,
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn stop_legacy_foreground_job(job: &crate::platform::ForegroundJob) -> io::Result<()> {
+    if job.process_group_id <= 1 || job.processes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "legacy foreground process group is not safely signalable",
+        ));
+    }
+    let pids: Vec<u32> = job.processes.iter().map(|process| process.pid).collect();
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        if unsafe { libc::kill(-(job.process_group_id as libc::pid_t), signal) } == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        let deadline = Instant::now() + CHILD_STOP_TIMEOUT;
+        while Instant::now() < deadline {
+            if pids
+                .iter()
+                .all(|pid| !crate::platform::process_exists(*pid))
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "legacy foreground process group did not exit",
     ))
 }
 
@@ -620,6 +732,70 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_bootstrap_journal_prevents_duplicate_or_conflicting_launches() {
+        let mut request = test_request(vec!["traex".into()]);
+        request.terminal_id = format!(
+            "terminal-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        remove_test_artifacts(&request.terminal_id);
+
+        assert_eq!(
+            prepare_legacy_bootstrap(&request).unwrap(),
+            SupervisorRotationResponse::Unknown
+        );
+        assert_eq!(
+            prepare_legacy_bootstrap(&request).unwrap(),
+            SupervisorRotationResponse::Pending
+        );
+
+        let mut conflicting = request.clone();
+        conflicting.launch_argv.push("--different".into());
+        assert_eq!(
+            prepare_legacy_bootstrap(&conflicting).unwrap(),
+            SupervisorRotationResponse::Conflict
+        );
+
+        let uncertain = SupervisorRotationResponse::Uncertain {
+            reason: "submission_unknown".into(),
+        };
+        record_legacy_bootstrap_result(&request, uncertain.clone()).unwrap();
+        assert_eq!(query_rotation(&request).unwrap(), uncertain);
+
+        remove_test_artifacts(&request.terminal_id);
+    }
+
+    #[test]
+    fn supervisor_args_preserve_the_bootstrap_operation_identity() {
+        assert_eq!(
+            parse_args(&[
+                "--pane-id".into(),
+                "w1:p1".into(),
+                "--terminal-id".into(),
+                "terminal-1".into(),
+                "--bootstrap-operation".into(),
+                "clear-42".into(),
+                "--".into(),
+                "traex".into(),
+                "--model".into(),
+                "default".into(),
+            ])
+            .unwrap(),
+            (
+                "w1:p1".into(),
+                "terminal-1".into(),
+                Some("clear-42".into()),
+                vec!["traex".into(), "--model".into(), "default".into()],
+            )
+        );
     }
 
     #[test]

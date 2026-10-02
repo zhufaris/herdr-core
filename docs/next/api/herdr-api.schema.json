@@ -710,6 +710,26 @@
             },
             {
               "properties": {
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -753,6 +773,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "session_events_available",
             "layout_updated"
           ],
           "type": "string"
@@ -4432,6 +4453,18 @@
             },
             {
               "properties": {
+                "type": {
+                  "const": "session.events.available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "lines": {
                   "format": "uint32",
                   "minimum": 0,
@@ -7973,6 +8006,26 @@
             },
             {
               "properties": {
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -8031,6 +8084,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "session_events_available",
             "layout_updated"
           ],
           "type": "string"
@@ -9858,6 +9912,96 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
+                },
+                "submission_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "submission_receipt",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "submission_id",
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                },
+                "type": {
+                  "const": "runtime_status_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "runtime_agent_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "released"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "runtime_ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "reason"
               ],
               "type": "object"
             },

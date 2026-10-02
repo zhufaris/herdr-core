@@ -185,6 +185,7 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            EventData::SessionEventsAvailable { .. } => empty_plugin_context(correlation_id),
         }
     }
 

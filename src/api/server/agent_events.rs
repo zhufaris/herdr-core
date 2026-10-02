@@ -9,7 +9,7 @@ use crate::api::schema::agent_events::{
     SessionEventsReadParams, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, PaneProcessInfoParams, Request, ResponseResult};
-use crate::api::ApiRequestSender;
+use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::{local_stream_peer_closed, LocalStream};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -24,20 +24,27 @@ pub(super) struct ReplyStreams {
     directory: PathBuf,
     subscribers: AtomicUsize,
     running: Arc<AtomicBool>,
+    event_hub: EventHub,
     revision: Mutex<u64>,
     changed: Condvar,
 }
 
 impl ReplyStreams {
-    pub fn start(api_tx: ApiRequestSender, running: Arc<AtomicBool>) -> Arc<Self> {
+    pub fn start(
+        api_tx: ApiRequestSender,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         let service = Arc::new(Self {
             journal: Mutex::new(None),
             directory: crate::session::data_dir().join("agent-events"),
             subscribers: AtomicUsize::new(0),
             running: running.clone(),
+            event_hub: event_hub.clone(),
             revision: Mutex::new(0),
             changed: Condvar::new(),
         });
+        service.install_event_recorder();
         let worker = service.clone();
         std::thread::spawn(move || {
             let mut tick = 0u32;
@@ -57,6 +64,14 @@ impl ReplyStreams {
             }
         });
         service
+    }
+    fn install_event_recorder(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.event_hub
+            .set_session_event_recorder(Arc::new(move |runtime_key, event| {
+                weak.upgrade()
+                    .and_then(|service| service.record_core_event(runtime_key, event))
+            }));
     }
     fn with_journal<T>(
         &self,
@@ -141,6 +156,7 @@ impl ReplyStreams {
         };
         self.with_journal(true, |j| {
             let checkpoint = j.attach(&source, &initial)?;
+            j.bind_source_to_pane(&source.id, &params.pane_id)?;
             Ok(ResponseResult::AgentEventsAttached {
                 source_id: source.id,
                 attach_offset: checkpoint.offset,
@@ -209,6 +225,7 @@ impl ReplyStreams {
         };
         self.with_journal(true, |journal| {
             journal.attach(&source, &Checkpoint::default())?;
+            journal.bind_source_to_pane(&source.id, &params.pane_id)?;
             let batch = journal.read(&source.id, "latest", 1)?;
             Ok(SessionEventStream {
                 stream_id: source.id.clone(),
@@ -277,14 +294,13 @@ impl ReplyStreams {
         submission_id: &str,
         state: AgentEventsSubmissionState,
     ) -> crate::agent_events::Result<AgentEventsSubmissionReceipt> {
-        self.with_journal(false, |journal| match state {
-            AgentEventsSubmissionState::Prepared => journal.submission_receipt(submission_id),
-            AgentEventsSubmissionState::Accepted => journal.mark_submission_accepted(submission_id),
-            AgentEventsSubmissionState::Rejected => journal.mark_submission_rejected(submission_id),
-            AgentEventsSubmissionState::Uncertain => {
-                journal.mark_submission_uncertain(submission_id)
-            }
-        })
+        let (receipt, availability) = self.with_journal(false, |journal| {
+            journal.settle_submission(submission_id, state)
+        })?;
+        if let Some(availability) = availability {
+            self.publish_availability(availability);
+        }
+        Ok(receipt)
     }
     pub fn read(
         &self,
@@ -388,8 +404,15 @@ impl ReplyStreams {
             match SourceReader::read(&source, &cp) {
                 Ok((next, events)) => {
                     if next != cp {
-                        self.with_journal(false, |j| j.commit(&source, &cp, &next, events))?;
+                        let latest_cursor = self.with_journal(false, |journal| {
+                            journal.commit(&source, &cp, &next, events)?;
+                            Ok(journal.read(&source.id, "latest", 1)?.latest_cursor)
+                        })?;
                         self.notify();
+                        self.publish_availability(crate::agent_events::JournalAvailability {
+                            source_id: source.id.clone(),
+                            latest_cursor,
+                        });
                     }
                 }
                 Err(error) => self.fail(&source, error.0)?,
@@ -402,8 +425,15 @@ impl ReplyStreams {
         source: &RegisteredSource,
         code: &'static str,
     ) -> crate::agent_events::Result<()> {
-        self.with_journal(false, |j| j.fail(source, code))?;
+        let latest_cursor = self.with_journal(false, |journal| {
+            journal.fail(source, code)?;
+            Ok(journal.read(&source.id, "latest", 1)?.latest_cursor)
+        })?;
         self.notify();
+        self.publish_availability(crate::agent_events::JournalAvailability {
+            source_id: source.id.clone(),
+            latest_cursor,
+        });
         Ok(())
     }
     fn notify(&self) {
@@ -411,6 +441,37 @@ impl ReplyStreams {
             *revision = revision.wrapping_add(1);
             self.changed.notify_all();
         }
+    }
+    fn record_core_event(
+        &self,
+        runtime_key: &str,
+        event: &crate::api::schema::EventEnvelope,
+    ) -> Option<crate::api::schema::EventEnvelope> {
+        if !matches!(
+            event.event,
+            crate::api::schema::EventKind::PaneAgentDetected
+                | crate::api::schema::EventKind::PaneAgentStatusChanged
+                | crate::api::schema::EventKind::PaneExited
+                | crate::api::schema::EventKind::PaneClosed
+        ) {
+            return None;
+        }
+        match self.with_journal(false, |journal| {
+            journal.record_core_event(runtime_key, event)
+        }) {
+            Ok(Some(availability)) => {
+                self.notify();
+                Some(availability_event(availability))
+            }
+            Ok(None) | Err(EventError("events_disabled")) => None,
+            Err(error) => {
+                tracing::warn!(code = error.0, "core session event persistence unavailable");
+                None
+            }
+        }
+    }
+    fn publish_availability(&self, availability: crate::agent_events::JournalAvailability) {
+        self.event_hub.push(availability_event(availability));
     }
     pub fn subscribe(
         &self,
@@ -544,6 +605,18 @@ impl ReplyStreams {
                 .map_err(|_| std::io::Error::other("event notifier unavailable"))?;
         }
         Ok(())
+    }
+}
+
+fn availability_event(
+    availability: crate::agent_events::JournalAvailability,
+) -> crate::api::schema::EventEnvelope {
+    crate::api::schema::EventEnvelope {
+        event: crate::api::schema::EventKind::SessionEventsAvailable,
+        data: crate::api::schema::EventData::SessionEventsAvailable {
+            stream_id: availability.source_id,
+            latest_cursor: availability.latest_cursor,
+        },
     }
 }
 
@@ -740,6 +813,123 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[test]
+    fn runtime_fact_commit_publishes_recoverable_path_free_wake() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-session-runtime-fact-{}-{}",
+            std::process::id(),
+            crate::agent_events::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let event_hub = EventHub::default();
+        let service = Arc::new(ReplyStreams {
+            journal: Mutex::new(None),
+            directory: root.join("events"),
+            subscribers: AtomicUsize::new(0),
+            running,
+            event_hub: event_hub.clone(),
+            revision: Mutex::new(0),
+            changed: Condvar::new(),
+        });
+        let source = RegisteredSource {
+            id: "stream-1".into(),
+            terminal_id: "terminal-1".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            path: "/unused".into(),
+            foreground_pid: 1,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        service
+            .with_journal(true, |journal| {
+                journal.attach(&source, &Checkpoint::default())?;
+                journal.bind_source_to_pane(&source.id, "pane-1")
+            })
+            .unwrap();
+        service.install_event_recorder();
+
+        for title in ["first presentation", "second presentation"] {
+            event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                    pane_id: "pane-1".into(),
+                    workspace_id: "workspace-1".into(),
+                    agent_status: crate::api::schema::AgentStatus::Working,
+                    agent: Some("primary".into()),
+                    title: Some(title.into()),
+                    display_agent: None,
+                    state_labels: Default::default(),
+                },
+            });
+        }
+
+        let wakes: Vec<_> = event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, event)| {
+                event.event == crate::api::schema::EventKind::SessionEventsAvailable
+            })
+            .collect();
+        assert_eq!(wakes.len(), 1);
+        let crate::api::schema::EventData::SessionEventsAvailable {
+            stream_id,
+            latest_cursor,
+        } = &wakes[0].1.data
+        else {
+            panic!("expected session stream wake");
+        };
+        assert_eq!(stream_id, "stream-1");
+        let committed = service
+            .read_session(&SessionEventsReadParams {
+                stream_id: stream_id.clone(),
+                after: "start".into(),
+                limit: 128,
+            })
+            .unwrap();
+        assert_eq!(committed.next_cursor, *latest_cursor);
+        assert_eq!(committed.events.len(), 1);
+        assert!(matches!(
+            committed.events[0].payload,
+            crate::api::schema::agent_events::ReplyPayload::RuntimeStatusChanged {
+                status: crate::api::schema::AgentStatus::Working,
+                ..
+            }
+        ));
+
+        for revision in 0..600 {
+            event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneOutputChanged,
+                data: crate::api::schema::EventData::PaneOutputChanged {
+                    pane_id: "pane-1".into(),
+                    workspace_id: "workspace-1".into(),
+                    revision,
+                },
+            });
+        }
+        assert!(!event_hub.events_after(0).iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::SessionEventsAvailable
+        }));
+        assert_eq!(
+            service
+                .read_session(&SessionEventsReadParams {
+                    stream_id: "stream-1".into(),
+                    after: "start".into(),
+                    limit: 128,
+                })
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+
+        drop(service);
+        std::fs::remove_file(root.join("events/events.lock")).unwrap();
+        std::fs::remove_file(root.join("events/events.db")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn session_stream_round_trip(
         service: &ReplyStreams,
         api_tx: &ApiRequestSender,
@@ -849,6 +1039,7 @@ mod tests {
             directory: root.join("events"),
             subscribers: AtomicUsize::new(0),
             running: running.clone(),
+            event_hub: EventHub::default(),
             revision: Mutex::new(0),
             changed: Condvar::new(),
         });
@@ -1085,6 +1276,7 @@ mod tests {
             directory: root.join("events"),
             subscribers: AtomicUsize::new(0),
             running: Arc::new(AtomicBool::new(true)),
+            event_hub: EventHub::default(),
             revision: Mutex::new(0),
             changed: Condvar::new(),
         });

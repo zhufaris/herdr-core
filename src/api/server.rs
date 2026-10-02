@@ -94,7 +94,8 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
-    let reply_streams = agent_events::ReplyStreams::start(api_tx.clone(), running.clone());
+    let reply_streams =
+        agent_events::ReplyStreams::start(api_tx.clone(), event_hub.clone(), running.clone());
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {

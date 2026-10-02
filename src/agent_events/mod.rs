@@ -2,7 +2,7 @@ mod codec;
 mod journal;
 mod source;
 
-pub(crate) use journal::{Journal, SubmissionPrepareResult};
+pub(crate) use journal::{Journal, JournalAvailability, SubmissionPrepareResult};
 pub(crate) use source::{Checkpoint, RegisteredSource, SourceReader};
 
 use std::fmt;

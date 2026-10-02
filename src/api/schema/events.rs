@@ -62,6 +62,8 @@ pub enum Subscription {
     PaneExited {},
     #[serde(rename = "pane.agent_detected")]
     PaneAgentDetected {},
+    #[serde(rename = "session.events.available")]
+    SessionEventsAvailable {},
     #[serde(rename = "pane.output_matched")]
     PaneOutputMatched {
         pane_id: String,
@@ -217,6 +219,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    SessionEventsAvailable,
     LayoutUpdated,
 }
 
@@ -248,6 +251,7 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::SessionEventsAvailable => "session.events.available",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -280,6 +284,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::SessionEventsAvailable,
     EventKind::LayoutUpdated,
 ];
 
@@ -549,6 +554,10 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    SessionEventsAvailable {
+        stream_id: String,
+        latest_cursor: String,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

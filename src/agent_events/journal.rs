@@ -20,6 +20,12 @@ pub(crate) enum SubmissionPrepareResult {
     Duplicate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalAvailability {
+    pub source_id: String,
+    pub latest_cursor: String,
+}
+
 pub(crate) struct Journal {
     db: Connection,
     id: String,
@@ -41,7 +47,7 @@ impl Journal {
         writer_lock
             .try_lock()
             .map_err(|_| EventError("journal_writer_busy"))?;
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > JOURNAL_VERSION {
@@ -53,6 +59,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, definition TEXT NOT NULL, checkpoint TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', error TEXT, floor INTEGER NOT NULL DEFAULT 0, latest INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE(source,key));
             CREATE INDEX IF NOT EXISTS events_source_seq ON events(source,seq);
+            CREATE TABLE IF NOT EXISTS source_panes (source TEXT PRIMARY KEY, pane_id TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS session_native_state (source TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(source,kind));
             CREATE TABLE IF NOT EXISTS pending_submissions (submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL, text_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','consumed')), created INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
             PRAGMA user_version=1;")?;
@@ -87,14 +95,41 @@ impl Journal {
                 COMMIT;",
             )?;
         }
-        db.execute(
+        let id: String = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
+            r.get(0)
+        })?;
+        let tx = db.transaction()?;
+        let prepared = {
+            let mut stmt =
+                tx.prepare("SELECT submission_id FROM pending_submissions WHERE state='prepared'")?;
+            let values = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            values
+        };
+        tx.execute(
             "UPDATE pending_submissions SET state='uncertain',updated=?
              WHERE state='prepared'",
             [now()],
         )?;
-        let id = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
-            r.get(0)
-        })?;
+        for submission_id in prepared {
+            let receipt = submission_receipt_from(&tx, &submission_id)?;
+            if let Some(source) = matching_source_for_receipt(&tx, &receipt)? {
+                insert_event(
+                    &tx,
+                    &id,
+                    &source,
+                    &format!("submission:{submission_id}:uncertain"),
+                    None,
+                    super::timestamp(),
+                    ReplyPayload::SubmissionReceipt {
+                        submission_id,
+                        state: AgentEventsSubmissionState::Uncertain,
+                    },
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(Self {
             db,
             id,
@@ -142,6 +177,31 @@ impl Journal {
             params![source.id, definition, serde_json::to_string(initial)?],
         )?;
         Ok(initial.clone())
+    }
+
+    pub(crate) fn bind_source_to_pane(&mut self, source_id: &str, pane_id: &str) -> Result<()> {
+        if pane_id.is_empty() || pane_id.len() > 256 {
+            return Err(EventError("invalid_pane_id"));
+        }
+        let tx = self.db.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE id=?)",
+            [source_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(EventError("source_not_found"));
+        }
+        tx.execute(
+            "DELETE FROM source_panes WHERE pane_id=? OR source=?",
+            params![pane_id, source_id],
+        )?;
+        tx.execute(
+            "INSERT INTO source_panes(source,pane_id) VALUES (?,?)",
+            params![source_id, pane_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn prepare_submission(
@@ -229,55 +289,109 @@ impl Journal {
             .ok_or(EventError("submission_not_found"))
     }
 
-    pub(crate) fn mark_submission_accepted(
+    pub(crate) fn settle_submission(
         &mut self,
         submission_id: &str,
-    ) -> Result<AgentEventsSubmissionReceipt> {
-        self.transition_prepared_submission(
-            submission_id,
-            "accepted",
-            AgentEventsSubmissionState::Accepted,
-        )
-    }
-
-    pub(crate) fn mark_submission_rejected(
-        &mut self,
-        submission_id: &str,
-    ) -> Result<AgentEventsSubmissionReceipt> {
-        self.transition_prepared_submission(
-            submission_id,
-            "rejected",
-            AgentEventsSubmissionState::Rejected,
-        )
-    }
-
-    pub(crate) fn mark_submission_uncertain(
-        &mut self,
-        submission_id: &str,
-    ) -> Result<AgentEventsSubmissionReceipt> {
-        self.transition_prepared_submission(
-            submission_id,
-            "uncertain",
-            AgentEventsSubmissionState::Uncertain,
-        )
-    }
-
-    fn transition_prepared_submission(
-        &mut self,
-        submission_id: &str,
-        stored_state: &str,
         expected_state: AgentEventsSubmissionState,
-    ) -> Result<AgentEventsSubmissionReceipt> {
-        self.db.execute(
+    ) -> Result<(AgentEventsSubmissionReceipt, Option<JournalAvailability>)> {
+        if expected_state == AgentEventsSubmissionState::Prepared {
+            return Ok((self.submission_receipt(submission_id)?, None));
+        }
+        let stored_state = submission_state_name(expected_state);
+        let journal_id = self.id.clone();
+        let tx = self.db.transaction()?;
+        tx.execute(
             "UPDATE pending_submissions SET state=?,updated=?
              WHERE submission_id=? AND state='prepared'",
             params![stored_state, now(), submission_id],
         )?;
-        let receipt = self.submission_receipt(submission_id)?;
+        let receipt = submission_receipt_from(&tx, submission_id)?;
         if receipt.state != expected_state {
             return Err(EventError("submission_state_conflict"));
         }
-        Ok(receipt)
+        let source = matching_source_for_receipt(&tx, &receipt)?;
+        let inserted = if let Some(source) = source.as_ref() {
+            insert_event(
+                &tx,
+                &journal_id,
+                source,
+                &format!("submission:{}:{stored_state}", receipt.submission_id),
+                None,
+                super::timestamp(),
+                ReplyPayload::SubmissionReceipt {
+                    submission_id: receipt.submission_id.clone(),
+                    state: receipt.state,
+                },
+            )?
+        } else {
+            None
+        };
+        tx.commit()?;
+        let availability = source
+            .zip(inserted)
+            .map(|(source, sequence)| JournalAvailability {
+                source_id: source.id.clone(),
+                latest_cursor: self.cursor(&source.id, sequence),
+            });
+        Ok((receipt, availability))
+    }
+
+    pub(crate) fn record_core_event(
+        &mut self,
+        runtime_key: &str,
+        event: &crate::api::schema::EventEnvelope,
+    ) -> Result<Option<JournalAvailability>> {
+        let Some((pane_id, kind, payload)) = normalize_core_event(event) else {
+            return Ok(None);
+        };
+        let source: Option<RegisteredSource> = self
+            .db
+            .query_row(
+                "SELECT s.definition FROM source_panes p JOIN sources s ON s.id=p.source
+                 WHERE p.pane_id=? AND s.state='active'",
+                [pane_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|definition| serde_json::from_str(&definition))
+            .transpose()?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let journal_id = self.id.clone();
+        let tx = self.db.transaction()?;
+        let state_value = serde_json::to_string(&payload)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM session_native_state WHERE source=? AND kind=?",
+                params![source.id, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(state_value.as_str()) {
+            return Ok(None);
+        }
+        let inserted = insert_event(
+            &tx,
+            &journal_id,
+            &source,
+            &format!("core:{runtime_key}:{kind}"),
+            None,
+            super::timestamp(),
+            payload,
+        )?;
+        if inserted.is_some() {
+            tx.execute(
+                "INSERT INTO session_native_state(source,kind,value) VALUES (?,?,?)
+                 ON CONFLICT(source,kind) DO UPDATE SET value=excluded.value",
+                params![source.id, kind, state_value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted.map(|sequence| JournalAvailability {
+            source_id: source.id.clone(),
+            latest_cursor: self.cursor(&source.id, sequence),
+        }))
     }
 
     pub(crate) fn pending(&self, verify_all: bool) -> Result<Vec<(RegisteredSource, Checkpoint)>> {
@@ -659,6 +773,161 @@ impl Journal {
     }
 }
 
+fn submission_state_name(state: AgentEventsSubmissionState) -> &'static str {
+    match state {
+        AgentEventsSubmissionState::Prepared => "prepared",
+        AgentEventsSubmissionState::Accepted => "accepted",
+        AgentEventsSubmissionState::Rejected => "rejected",
+        AgentEventsSubmissionState::Uncertain => "uncertain",
+    }
+}
+
+fn submission_receipt_from(
+    tx: &rusqlite::Transaction<'_>,
+    submission_id: &str,
+) -> Result<AgentEventsSubmissionReceipt> {
+    tx.query_row(
+        "SELECT terminal_id,agent_kind,session_id,state,created,updated
+         FROM pending_submissions WHERE submission_id=?",
+        [submission_id],
+        |row| {
+            let kind: String = row.get(1)?;
+            let state: String = row.get(3)?;
+            Ok(AgentEventsSubmissionReceipt {
+                submission_id: submission_id.to_owned(),
+                terminal_id: row.get(0)?,
+                agent_kind: match kind.as_str() {
+                    "traex" => TranscriptKind::Traex,
+                    "pi" => TranscriptKind::Pi,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                },
+                session_id: row.get(2)?,
+                state: match state.as_str() {
+                    "prepared" => AgentEventsSubmissionState::Prepared,
+                    "accepted" => AgentEventsSubmissionState::Accepted,
+                    "rejected" => AgentEventsSubmissionState::Rejected,
+                    "uncertain" => AgentEventsSubmissionState::Uncertain,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                },
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(EventError("submission_not_found"))
+}
+
+fn matching_source_for_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &AgentEventsSubmissionReceipt,
+) -> Result<Option<RegisteredSource>> {
+    let mut stmt = tx.prepare(
+        "SELECT s.definition FROM sources s JOIN source_panes p ON p.source=s.id
+         WHERE s.state='active'",
+    )?;
+    let definitions = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for definition in definitions {
+        let source: RegisteredSource = serde_json::from_str(&definition)?;
+        if source.terminal_id == receipt.terminal_id
+            && source.kind == receipt.agent_kind
+            && source.session_id == receipt.session_id
+        {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
+}
+
+fn insert_event(
+    tx: &rusqlite::Transaction<'_>,
+    journal_id: &str,
+    source: &RegisteredSource,
+    key: &str,
+    turn_id: Option<String>,
+    occurred_at: String,
+    payload: ReplyPayload,
+) -> Result<Option<i64>> {
+    let body = AgentReplyEvent {
+        schema_version: 1,
+        event_id: digest(format!("{journal_id}:{}:{key}", source.id).as_bytes()),
+        cursor: String::new(),
+        source_id: source.id.clone(),
+        agent_kind: source.kind,
+        session_id: source.session_id.clone(),
+        turn_id,
+        occurred_at,
+        payload,
+    };
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO events(source,key,body,created) VALUES (?,?,?,?)",
+        params![source.id, key, serde_json::to_string(&body)?, now()],
+    )?;
+    if inserted == 0 {
+        return Ok(None);
+    }
+    let sequence = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE sources SET latest=? WHERE id=?",
+        params![sequence, source.id],
+    )?;
+    Ok(Some(sequence))
+}
+
+fn normalize_core_event(
+    event: &crate::api::schema::EventEnvelope,
+) -> Option<(&str, &'static str, ReplyPayload)> {
+    use crate::api::schema::EventData;
+    match &event.data {
+        EventData::PaneAgentStatusChanged {
+            pane_id,
+            agent_status,
+            ..
+        } => Some((
+            pane_id,
+            "runtime_status_changed",
+            ReplyPayload::RuntimeStatusChanged {
+                pane_id: pane_id.clone(),
+                status: *agent_status,
+            },
+        )),
+        EventData::PaneAgentDetected {
+            pane_id,
+            released,
+            final_status,
+            ..
+        } => Some((
+            pane_id,
+            "runtime_agent_changed",
+            ReplyPayload::RuntimeAgentChanged {
+                pane_id: pane_id.clone(),
+                released: *released,
+                final_status: *final_status,
+            },
+        )),
+        EventData::PaneExited { pane_id, .. } => Some((
+            pane_id,
+            "runtime_ended",
+            ReplyPayload::RuntimeEnded {
+                pane_id: pane_id.clone(),
+                reason: "exited".into(),
+            },
+        )),
+        EventData::PaneClosed { pane_id, .. } => Some((
+            pane_id,
+            "runtime_ended",
+            ReplyPayload::RuntimeEnded {
+                pane_id: pane_id.clone(),
+                reason: "closed".into(),
+            },
+        )),
+        _ => None,
+    }
+}
+
 fn timestamps_equal(left: &str, right: &str) -> bool {
     let format = &time::format_description::well_known::Rfc3339;
     match (
@@ -888,7 +1157,9 @@ mod tests {
                 .unwrap(),
             SubmissionPrepareResult::Duplicate
         );
-        journal.mark_submission_accepted("prompt-1").unwrap();
+        journal
+            .settle_submission("prompt-1", AgentEventsSubmissionState::Accepted)
+            .unwrap();
         let mut next = before.clone();
         next.offset = 10;
         journal
@@ -935,6 +1206,186 @@ mod tests {
     }
 
     #[test]
+    fn agent_native_and_submission_facts_share_one_deduplicated_session_order() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-unified-order-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let source = RegisteredSource {
+            id: "source".into(),
+            terminal_id: "term".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session".into(),
+            path: "/unused".into(),
+            foreground_pid: 1,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let before = journal.attach(&source, &Checkpoint::default()).unwrap();
+        journal.bind_source_to_pane("source", "pane-1").unwrap();
+        let mut next = before.clone();
+        next.offset = 10;
+        journal
+            .commit(
+                &source,
+                &before,
+                &next,
+                vec![Decoded {
+                    key: "turn-started".into(),
+                    turn: Some("turn-1".into()),
+                    time: "2026-10-02T00:00:00Z".into(),
+                    payload: ReplyPayload::TurnStarted,
+                }],
+            )
+            .unwrap();
+
+        let runtime = crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+            data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                pane_id: "pane-1".into(),
+                workspace_id: "workspace-1".into(),
+                agent_status: crate::api::schema::AgentStatus::Working,
+                agent: Some("primary".into()),
+                title: Some("must not persist".into()),
+                display_agent: Some("must not persist".into()),
+                state_labels: std::collections::HashMap::from([(
+                    "private".into(),
+                    "must not persist".into(),
+                )]),
+            },
+        };
+        let first_runtime = journal
+            .record_core_event("runtime-1", &runtime)
+            .unwrap()
+            .expect("selected runtime event is persisted");
+        let duplicate_runtime = journal.record_core_event("runtime-1", &runtime).unwrap();
+        assert!(duplicate_runtime.is_none());
+
+        journal
+            .prepare_submission(
+                "prompt-1",
+                "term",
+                TranscriptKind::Traex,
+                "session",
+                "continue",
+            )
+            .unwrap();
+        let (_, receipt_event) = journal
+            .settle_submission("prompt-1", AgentEventsSubmissionState::Accepted)
+            .unwrap();
+        assert!(receipt_event.is_some());
+
+        let batch = journal.read("source", "start", 64).unwrap();
+        assert_eq!(batch.events.len(), 3);
+        assert!(matches!(batch.events[0].payload, ReplyPayload::TurnStarted));
+        assert!(matches!(
+            batch.events[1].payload,
+            ReplyPayload::RuntimeStatusChanged {
+                ref pane_id,
+                status: crate::api::schema::AgentStatus::Working,
+            } if pane_id == "pane-1"
+        ));
+        assert!(matches!(
+            batch.events[2].payload,
+            ReplyPayload::SubmissionReceipt {
+                ref submission_id,
+                state: AgentEventsSubmissionState::Accepted,
+            } if submission_id == "prompt-1"
+        ));
+        assert_eq!(first_runtime.latest_cursor, batch.events[1].cursor);
+        assert!(!serde_json::to_string(&batch)
+            .unwrap()
+            .contains("must not persist"));
+
+        let excluded = crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneOutputChanged,
+            data: crate::api::schema::EventData::PaneOutputChanged {
+                pane_id: "pane-1".into(),
+                workspace_id: "workspace-1".into(),
+                revision: 99,
+            },
+        };
+        assert!(journal
+            .record_core_event("runtime-2", &excluded)
+            .unwrap()
+            .is_none());
+        assert_eq!(journal.read("source", "start", 64).unwrap().events.len(), 3);
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pane_source_rebinding_routes_native_facts_only_to_the_current_stream() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-pane-rebinding-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let source = |id: &str, terminal_id: &str, session_id: &str| RegisteredSource {
+            id: id.into(),
+            terminal_id: terminal_id.into(),
+            kind: TranscriptKind::Traex,
+            session_id: session_id.into(),
+            path: format!("/unused/{id}").into(),
+            foreground_pid: 1,
+            header_hash: format!("header-{id}"),
+            file_identity: format!("file-{id}"),
+        };
+        let first = source("source-1", "term-1", "session-1");
+        let second = source("source-2", "term-2", "session-2");
+        let mut journal = Journal::open(&path).unwrap();
+        journal.attach(&first, &Checkpoint::default()).unwrap();
+        journal.attach(&second, &Checkpoint::default()).unwrap();
+        journal.bind_source_to_pane(&first.id, "pane-1").unwrap();
+
+        assert_eq!(
+            journal
+                .bind_source_to_pane("missing-source", "pane-1")
+                .unwrap_err()
+                .0,
+            "source_not_found"
+        );
+        let status = crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+            data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                pane_id: "pane-1".into(),
+                workspace_id: "workspace-1".into(),
+                agent_status: crate::api::schema::AgentStatus::Working,
+                agent: Some("primary".into()),
+                title: None,
+                display_agent: None,
+                state_labels: Default::default(),
+            },
+        };
+        assert!(journal
+            .record_core_event("runtime-1", &status)
+            .unwrap()
+            .is_some());
+
+        journal.bind_source_to_pane(&second.id, "pane-1").unwrap();
+        assert!(journal
+            .record_core_event("runtime-2", &status)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            journal.read(&first.id, "start", 64).unwrap().events.len(),
+            1
+        );
+        assert_eq!(
+            journal.read(&second.id, "start", 64).unwrap().events.len(),
+            1
+        );
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn accepted_submission_receipt_survives_reopen_without_transcript_evidence() {
         let path = std::env::temp_dir().join(format!(
             "herdr-journal-submission-receipt-{}-{}.db",
@@ -959,7 +1410,10 @@ mod tests {
             AgentEventsSubmissionState::Prepared
         );
 
-        let accepted = journal.mark_submission_accepted("prompt-receipt").unwrap();
+        let accepted = journal
+            .settle_submission("prompt-receipt", AgentEventsSubmissionState::Accepted)
+            .unwrap()
+            .0;
         assert_eq!(accepted.state, AgentEventsSubmissionState::Accepted);
         drop(journal);
 
@@ -993,6 +1447,18 @@ mod tests {
             now()
         ));
         let mut journal = Journal::open(&path).unwrap();
+        let source = RegisteredSource {
+            id: "source".into(),
+            terminal_id: "term".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session".into(),
+            path: "/unused".into(),
+            foreground_pid: 1,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        journal.attach(&source, &Checkpoint::default()).unwrap();
+        journal.bind_source_to_pane("source", "pane-1").unwrap();
         journal
             .prepare_submission(
                 "prompt-uncertain",
@@ -1012,6 +1478,13 @@ mod tests {
                 .state,
             AgentEventsSubmissionState::Uncertain
         );
+        assert!(matches!(
+            &reopened.read("source", "start", 64).unwrap().events[0].payload,
+            ReplyPayload::SubmissionReceipt {
+                submission_id,
+                state: AgentEventsSubmissionState::Uncertain,
+            } if submission_id == "prompt-uncertain"
+        ));
         drop(reopened);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -1039,21 +1512,23 @@ mod tests {
 
         assert_eq!(
             journal
-                .mark_submission_rejected("prompt-rejected")
+                .settle_submission("prompt-rejected", AgentEventsSubmissionState::Rejected,)
                 .unwrap()
+                .0
                 .state,
             AgentEventsSubmissionState::Rejected
         );
         assert_eq!(
             journal
-                .mark_submission_uncertain("prompt-uncertain")
+                .settle_submission("prompt-uncertain", AgentEventsSubmissionState::Uncertain,)
                 .unwrap()
+                .0
                 .state,
             AgentEventsSubmissionState::Uncertain
         );
         assert_eq!(
             journal
-                .mark_submission_accepted("prompt-rejected")
+                .settle_submission("prompt-rejected", AgentEventsSubmissionState::Accepted,)
                 .unwrap_err()
                 .0,
             "submission_state_conflict"

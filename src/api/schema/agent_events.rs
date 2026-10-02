@@ -180,6 +180,24 @@ pub enum ReplyPayload {
     BranchChanged {
         parent_id: Option<String>,
     },
+    SubmissionReceipt {
+        submission_id: String,
+        state: AgentEventsSubmissionState,
+    },
+    RuntimeStatusChanged {
+        pane_id: String,
+        status: super::AgentStatus,
+    },
+    RuntimeAgentChanged {
+        pane_id: String,
+        released: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_status: Option<super::AgentStatus>,
+    },
+    RuntimeEnded {
+        pane_id: String,
+        reason: String,
+    },
     SourceError {
         code: String,
     },

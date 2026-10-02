@@ -27,7 +27,7 @@ pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
-    if let Ok(executable) = std::env::current_exe() {
+    if let Ok(executable) = crate::platform::launch_executable() {
         cmd.env("HERDR_BIN_PATH", executable);
     }
 }
@@ -127,6 +127,14 @@ pub(crate) fn opencode_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".config/opencode"))
 }
 
+pub(crate) fn opencode_state_dir() -> io::Result<PathBuf> {
+    if let Some(value) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("opencode"));
+    }
+
+    Ok(home_dir()?.join(".local/state/opencode"))
+}
+
 pub(crate) fn kilo_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".config/kilo"))
 }
@@ -165,6 +173,10 @@ pub(crate) fn qodercli_dir() -> io::Result<PathBuf> {
 
 pub(crate) fn qwen_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(QWEN_HOME_ENV_VAR, &[".qwen"])
+}
+
+pub(crate) fn letta_dir() -> io::Result<PathBuf> {
+    Ok(home_dir()?.join(".letta"))
 }
 
 pub(crate) fn cursor_dir() -> io::Result<PathBuf> {
@@ -246,5 +258,36 @@ pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
         _guard: guard,
         #[cfg(windows)]
         appdata: std::env::var_os("APPDATA"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_state_dir_defaults_to_local_state() {
+        let _lock = integration_env_lock();
+        let original = std::env::var_os("XDG_STATE_HOME");
+        std::env::remove_var("XDG_STATE_HOME");
+        let expected = home_dir().unwrap().join(".local/state/opencode");
+        assert_eq!(opencode_state_dir().unwrap(), expected);
+        match original {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
+    fn opencode_state_dir_honors_xdg_state_home() {
+        let _lock = integration_env_lock();
+        let original = std::env::var_os("XDG_STATE_HOME");
+        let xdg = std::env::temp_dir().join("herdr-xdg-state");
+        std::env::set_var("XDG_STATE_HOME", &xdg);
+        assert_eq!(opencode_state_dir().unwrap(), xdg.join("opencode"));
+        match original {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
 }

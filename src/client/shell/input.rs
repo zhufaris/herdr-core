@@ -14,9 +14,10 @@ pub(super) fn is_modal_paste_shortcut_for_platform(
     key: &crate::input::TerminalKey,
     macos: bool,
 ) -> bool {
-    matches!(key.code, KeyCode::Char('v' | 'V'))
-        && (key.modifiers.contains(KeyModifiers::CONTROL)
-            || macos && key.modifiers.contains(KeyModifiers::SUPER))
+    key.generated_text.as_deref().is_none_or(str::is_empty)
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
+        && (key.modifiers.difference(KeyModifiers::SHIFT) == KeyModifiers::CONTROL
+            || macos && key.modifiers.difference(KeyModifiers::SHIFT) == KeyModifiers::SUPER)
 }
 
 fn is_modal_paste_shortcut(key: &crate::input::TerminalKey) -> bool {
@@ -84,7 +85,7 @@ impl ClientShellState {
         )
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(test)]
     pub(crate) fn handle_input_bytes(&mut self, data: &[u8]) -> ClientShellInput {
         self.handle_raw_events(crate::raw_input::parse_raw_input_bytes_sync(data))
     }
@@ -134,7 +135,7 @@ impl ClientShellState {
             outcome.repaint = true;
             return true;
         }
-        self.pending_word_selection = None;
+        self.word_selection_gesture = None;
         if self.copy_or_terminal_mode() != ClientShellMode::Copy && self.selection.take().is_some()
         {
             self.stop_selection_autoscroll();
@@ -155,12 +156,16 @@ impl ClientShellState {
         outcome
     }
 
-    pub(super) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
+    pub(crate) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
         let mut outcome = ClientShellInput::default();
         if !events.is_empty() && self.endpoint_error.take().is_some() {
+            self.endpoint_error_deadline = None;
             outcome.repaint = true;
         }
         for event in events {
+            if self.handle_machine_badge_event(&event, &mut outcome) {
+                continue;
+            }
             if let Some(update) = host_theme_update(&event) {
                 push_host_theme_update(&mut outcome.requests, update);
             }
@@ -246,6 +251,7 @@ impl ClientShellState {
                         .push(ClientMessage::ClientShellFocus { focused: true });
                 }
                 RawInputEvent::OuterFocusLost => {
+                    outcome.repaint |= self.clear_link_hover();
                     self.outer_focused = Some(false);
                     self.release_input_leases(&mut outcome);
                     outcome
@@ -300,6 +306,7 @@ impl ClientShellState {
         key: crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) {
+        outcome.repaint |= self.clear_link_hover();
         if self.copy_operation_in_flight {
             self.copy_input_queue.push_back(key);
             return;
@@ -441,12 +448,14 @@ impl ClientShellState {
         {
             return false;
         }
-        if self
-            .copy_mode
-            .as_ref()
-            .is_some_and(|copy_mode| copy_mode.search_prompt.is_some())
+        if self.mode == ClientShellMode::Copy
+            && self.overlay.is_none()
+            && self
+                .copy_mode
+                .as_ref()
+                .is_some_and(|copy_mode| copy_mode.search_prompt.is_some())
         {
-            return self.overlay.is_none();
+            return true;
         }
         matches!(
             self.overlay.as_ref(),
@@ -526,7 +535,7 @@ impl ClientShellState {
         if matches!(key.code, KeyCode::Modifier(_)) {
             return None;
         }
-        self.pending_word_selection = None;
+        self.word_selection_gesture = None;
         if self.mode != ClientShellMode::Copy
             && self.copy_or_terminal_mode() != ClientShellMode::Copy
             && !self.config.copy_on_select
@@ -560,7 +569,7 @@ impl ClientShellState {
                     self.record_binding(binding, outcome);
                     return None;
                 }
-                if crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix) {
+                if self.config.keybinds.matches_prefix(key) {
                     self.mode = ClientShellMode::Prefix;
                     outcome.repaint = true;
                     return None;
@@ -575,7 +584,7 @@ impl ClientShellState {
                 } else {
                     ClientShellMode::Terminal
                 };
-                if crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix) {
+                if self.config.keybinds.matches_prefix(key) {
                     self.mode = return_mode;
                     outcome.repaint = true;
                     return self.focused_pane_id().map(ClientInputTarget::Pane);
@@ -606,7 +615,12 @@ impl ClientShellState {
                 None
             }
             ClientShellMode::Copy => {
-                if crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix) {
+                if self
+                    .copy_mode
+                    .as_ref()
+                    .is_none_or(|copy_mode| copy_mode.search_prompt.is_none())
+                    && self.config.keybinds.matches_prefix(key)
+                {
                     self.mode = ClientShellMode::Prefix;
                     outcome.repaint = true;
                 } else {
@@ -634,9 +648,8 @@ impl ClientShellState {
     ) {
         use crate::input::{KeybindAction, KeybindDispatch, KeybindMatch};
 
-        if key.code == KeyCode::Esc
-            || crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix)
-        {
+        self.pending_workspace_highlight = None;
+        if key.code == KeyCode::Esc || self.config.keybinds.matches_prefix(key) {
             self.mode = self.copy_or_terminal_mode();
             self.navigate_workspace_id = None;
             outcome.repaint = true;
@@ -865,6 +878,7 @@ impl ClientShellState {
             KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
                 super::aggregate_navigation::online_agent_targets(
                     &self.endpoints,
+                    &self.active_endpoint_id,
                     self.config.agent_panel_sort,
                 )
                 .get(*index)

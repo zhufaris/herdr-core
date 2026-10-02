@@ -37,6 +37,15 @@ fn run_devin_hook(
     )
 }
 
+fn run_grok_hook(hook_input: &str, envs: &[(&str, &str)]) -> Option<serde_json::Value> {
+    run_shell_hook_with_env(
+        "src/integration/assets/grok/herdr-agent-state.sh",
+        &["session"],
+        hook_input,
+        envs,
+    )
+}
+
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     run_shell_hook_with_env(asset_path, args, hook_input, &[])
 }
@@ -213,6 +222,21 @@ fn codex_hook_reports_persisted_root_session_and_ignores_ephemeral_or_nested_ses
         &[("CODEX_THREAD_ID", "parent-session")],
     )
     .is_none());
+
+    for (action, event) in [
+        ("working", "UserPromptSubmit"),
+        ("idle", "Stop"),
+        ("idle", "Interrupt"),
+    ] {
+        let request = run_codex_hook(
+            action,
+            &format!(r#"{{"hook_event_name":"{event}","session_id":"codex-session"}}"#),
+        )
+        .expect("Codex turn hook should report state");
+        assert_eq!(request["method"], "pane.report_agent");
+        assert_eq!(request["params"]["state"], action);
+        assert_eq!(request["params"]["agent_session_id"], "codex-session");
+    }
 }
 
 #[test]
@@ -235,6 +259,19 @@ fn copilot_hook_reports_session_id_from_stdin() {
     assert_eq!(camel["method"], "pane.report_agent_session");
     assert_eq!(camel["params"]["agent_session_id"], "copilot-camel-session");
     assert!(camel["params"].get("state").is_none());
+}
+
+#[test]
+fn grok_hook_reports_new_session_source() {
+    let request = run_grok_hook(
+        r#"{"hook_event_name":"session_start","source":"new","session_id":"new-session"}"#,
+        &[("GROK_SESSION_ID", "new-session")],
+    )
+    .expect("grok session start should report session identity");
+
+    assert_eq!(request["method"], "pane.report_agent_session");
+    assert_eq!(request["params"]["agent_session_id"], "new-session");
+    assert_eq!(request["params"]["session_start_source"], "new");
 }
 
 #[test]

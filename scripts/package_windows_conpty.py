@@ -4,9 +4,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -47,6 +52,142 @@ def pe_machine(data: bytes) -> int:
     return struct.unpack_from("<H", data, pe_offset + 4)[0]
 
 
+# Imported DLL name prefixes that identify the dynamic Microsoft C/C++
+# runtime. Matching by prefix covers release and debug variants
+# (msvcp140d.dll, vcruntime140_1.dll, ucrtbased.dll, ...), older versioned
+# runtimes (msvcr120.dll, msvcp120.dll), and the api-ms-win-crt-* Universal
+# CRT API sets. Shipping any of them would make the archive depend on a Visual
+# C++ Redistributable or on the Universal CRT that is not part of the
+# documented install contents.
+DYNAMIC_MSVC_RUNTIME_PREFIXES = (
+    "vcruntime140",
+    "msvcp",
+    "msvcr",
+    "concrt140",
+    "ucrtbase",
+    "api-ms-win-crt-",
+)
+
+# msvcrt.dll is the legacy CRT that ships with Windows and is always present,
+# so depending on it does not require the Visual C++ Redistributable.
+SYSTEM_CRT_DLLS = frozenset({"msvcrt.dll"})
+
+
+def is_dynamic_msvc_runtime(dll: str) -> bool:
+    """Return True when a PE import names a dynamic MSVC/UCRT runtime DLL."""
+    lowered = dll.lower()
+    if lowered in SYSTEM_CRT_DLLS:
+        return False
+    return lowered.startswith(DYNAMIC_MSVC_RUNTIME_PREFIXES)
+
+
+def _pe_sections(data: bytes) -> tuple[list[tuple[int, int, int]], int, int]:
+    """Return PE sections, the data-directory offset, and the image base."""
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    number_of_sections = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    if optional_offset + optional_size > len(data):
+        raise ValueError("file has a truncated PE optional header")
+    magic = struct.unpack_from("<H", data, optional_offset)[0]
+    if magic == 0x20B:
+        data_directory_offset = optional_offset + 112
+        image_base = struct.unpack_from("<Q", data, optional_offset + 24)[0]
+    elif magic == 0x10B:
+        data_directory_offset = optional_offset + 96
+        image_base = struct.unpack_from("<I", data, optional_offset + 28)[0]
+    else:
+        raise ValueError(f"unsupported PE optional header magic: 0x{magic:04x}")
+
+    sections: list[tuple[int, int, int]] = []
+    section_offset = optional_offset + optional_size
+    for index in range(number_of_sections):
+        header = section_offset + index * 40
+        if header + 40 > len(data):
+            raise ValueError("file has truncated PE section headers")
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from(
+            "<IIII", data, header + 8
+        )
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_pointer))
+    return sections, data_directory_offset, image_base
+
+
+def pe_imported_dlls(data: bytes) -> list[str]:
+    """Return the DLL names from the PE import and delay-import tables."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise ValueError("file is not a PE image")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ValueError("file has an invalid PE header")
+
+    sections, data_directory_offset, image_base = _pe_sections(data)
+
+    def rva_to_offset(rva: int) -> int | None:
+        for virtual_address, virtual_size, raw_pointer in sections:
+            if virtual_address <= rva < virtual_address + virtual_size:
+                return raw_pointer + (rva - virtual_address)
+        return None
+
+    def read_c_string(offset: int | None) -> str:
+        if offset is None or offset < 0 or offset >= len(data):
+            raise ValueError("PE import name points outside the file")
+        end = data.find(b"\0", offset)
+        if end == -1:
+            raise ValueError("PE import name is not NUL-terminated")
+        return data[offset:end].decode("ascii", errors="replace")
+
+    # Directory index 1 is the import table, index 13 is the delay-import
+    # table. Delay-import descriptors store addresses as VAs unless their
+    # attributes set the RVA flag (bit 1), so normalize those to RVAs.
+    names: list[str] = []
+    for directory_index, descriptor_size, name_field, has_attributes in (
+        (1, 20, 12, False),
+        (13, 32, 4, True),
+    ):
+        entry_offset = data_directory_offset + directory_index * 8
+        if entry_offset + 8 > len(data):
+            continue
+        directory_rva, directory_size = struct.unpack_from("<II", data, entry_offset)
+        if directory_rva == 0:
+            continue
+        directory_offset = rva_to_offset(directory_rva)
+        if directory_offset is None:
+            continue
+        # Bound each walk by the directory's declared size so bytes past the
+        # terminator are not parsed as descriptors. Fall back to the file end
+        # if a linker omits the size.
+        directory_end = (
+            min(directory_offset + directory_size, len(data))
+            if directory_size
+            else len(data)
+        )
+        position = directory_offset
+        while position + descriptor_size <= directory_end:
+            if data[position : position + descriptor_size] == b"\0" * descriptor_size:
+                break
+            name_value = struct.unpack_from("<I", data, position + name_field)[0]
+            if name_value == 0:
+                break
+            if has_attributes and not struct.unpack_from("<I", data, position)[0] & 1:
+                name_value -= image_base
+            names.append(read_c_string(rva_to_offset(name_value)))
+            position += descriptor_size
+    return names
+
+
+def validate_static_msvc_runtime(data: bytes, label: str) -> None:
+    """Reject an executable that depends on the dynamic Microsoft C runtime."""
+    offending = sorted(
+        {dll for dll in pe_imported_dlls(data) if is_dynamic_msvc_runtime(dll)}
+    )
+    if offending:
+        raise ValueError(
+            f"{label} depends on the dynamic Microsoft C/C++ runtime "
+            f"({', '.join(offending)}); the Windows archive must link the CRT "
+            "statically so it runs on a clean Windows install"
+        )
+
+
 def validate_nuspec(archive: zipfile.ZipFile, package: dict[str, Any]) -> None:
     nuspec_name = f"{package['id']}.nuspec"
     try:
@@ -74,10 +215,18 @@ def validate_nuspec(archive: zipfile.ZipFile, package: dict[str, Any]) -> None:
 def acquire_package(package: dict[str, Any], package_path: Path) -> None:
     package_path.parent.mkdir(parents=True, exist_ok=True)
     if not package_path.exists():
-        with urllib.request.urlopen(
-            package["url"], timeout=DOWNLOAD_TIMEOUT_SECONDS
-        ) as response, package_path.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(
+                    package["url"], timeout=DOWNLOAD_TIMEOUT_SECONDS
+                ) as response, package_path.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+                break
+            except urllib.error.HTTPError as error:
+                if error.code < 500 or attempt == 2:
+                    raise
+                error.close()
+                time.sleep(2**attempt)
     actual = sha256_file(package_path)
     if actual != package["sha256"]:
         raise ValueError(
@@ -113,6 +262,8 @@ def stage_bundle(
         raise ValueError(f"output directory already exists: {output_dir}")
     if not herdr_exe.is_file():
         raise ValueError(f"Herdr executable does not exist: {herdr_exe}")
+
+    validate_static_msvc_runtime(herdr_exe.read_bytes(), herdr_exe.name)
 
     acquire_package(metadata["package"], package_path)
     bundle = metadata["bundles"][architecture]
@@ -165,6 +316,94 @@ def stage_bundle(
         staging.rename(output_dir)
 
 
+def install_local_bundle(
+    metadata_path: Path, architecture: str, package_path: Path, herdr_exe: Path
+) -> None:
+    release_dir = herdr_exe.resolve().parent
+    destination = release_dir / "conpty"
+    with tempfile.TemporaryDirectory(prefix="herdr-conpty-install-", dir=release_dir) as temporary:
+        stage = Path(temporary) / "stage"
+        stage_bundle(metadata_path, architecture, package_path, herdr_exe, stage)
+        staged_bundle = stage / "conpty"
+        if destination.exists() or destination.is_symlink():
+            staged_files = {
+                path.relative_to(staged_bundle)
+                for path in staged_bundle.rglob("*")
+                if path.is_file()
+            }
+            installed_files = {
+                path.relative_to(destination)
+                for path in destination.rglob("*")
+                if path.is_file()
+            }
+            matches = (
+                destination.is_dir()
+                and not destination.is_symlink()
+                and not any(path.is_symlink() for path in destination.rglob("*"))
+                and installed_files == staged_files
+                and all(
+                    not (destination / relative).is_symlink()
+                    and sha256_file(destination / relative) == sha256_file(staged_bundle / relative)
+                    for relative in staged_files
+                )
+            )
+            # ponytail: pin upgrades require stopping Herdr and removing the old local bundle.
+            if not matches:
+                raise ValueError(
+                    f"local ConPTY bundle at {destination} differs from the pinned version; "
+                    "stop Herdr, remove that directory, then run just build again"
+                )
+
+        for notice in load_metadata(metadata_path)["notices"]:
+            relative = PurePosixPath(notice["destination"])
+            target = release_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(stage / relative, target)
+        if not destination.exists():
+            staged_bundle.rename(destination)
+
+
+def build_local_bundle(metadata_path: Path) -> None:
+    executable = None
+    with subprocess.Popen(
+        ["cargo", "build", "--release", "--locked", "--message-format=json"],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    ) as cargo:
+        assert cargo.stdout is not None
+        for line in cargo.stdout:
+            if not line.startswith("{"):
+                print(line, end="")
+                continue
+            message = json.loads(line)
+            if message.get("reason") == "compiler-message":
+                print(message["message"]["rendered"], end="", file=sys.stderr)
+            elif (
+                message.get("reason") == "compiler-artifact"
+                and message["manifest_path"] == str(PROJECT_ROOT / "Cargo.toml")
+                and message["target"]["name"] == "herdr"
+                and "bin" in message["target"]["kind"]
+            ):
+                executable = Path(message["executable"])
+        status = cargo.wait()
+    if status:
+        raise SystemExit(status)
+    if executable is None:
+        raise ValueError("cargo did not report the Herdr executable")
+
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+    if not target.is_absolute():
+        target = PROJECT_ROOT / target
+    install_local_bundle(
+        metadata_path,
+        "x86_64",
+        target / "conpty" / "Microsoft.Windows.Console.ConPTY.nupkg",
+        executable,
+    )
+
+
 def expected_stage_files(metadata: dict[str, Any], architecture: str) -> set[str]:
     files = {"herdr.exe", MARKER_PATH.as_posix()}
     files.update(item["destination"] for item in metadata["bundles"][architecture]["files"])
@@ -186,6 +425,10 @@ def validate_stage(metadata_path: Path, architecture: str, stage_dir: Path) -> N
         )
     if (stage_dir / MARKER_PATH).read_bytes() != marker_data(metadata, architecture):
         raise ValueError("bundle marker does not match pinned ConPTY metadata")
+    # The executable is not hash-pinned (it changes every build), so re-check
+    # it here to cover a direct archive of an existing stage or a swap after
+    # staging.
+    validate_static_msvc_runtime((stage_dir / "herdr.exe").read_bytes(), "herdr.exe")
     for item in metadata["bundles"][architecture]["files"]:
         path = stage_dir / PurePosixPath(item["destination"])
         actual_hash = sha256_file(path)
@@ -224,6 +467,7 @@ def parse_args() -> argparse.Namespace:
     archive.add_argument("--architecture", choices=("x86_64",), default="x86_64")
     archive.add_argument("--stage-dir", type=Path, required=True)
     archive.add_argument("--output", type=Path, required=True)
+    subparsers.add_parser("build-local")
     return parser.parse_args()
 
 
@@ -237,8 +481,10 @@ def main() -> None:
             args.herdr_exe,
             args.output_dir,
         )
-    else:
+    elif args.command == "archive":
         archive_bundle(args.metadata, args.architecture, args.stage_dir, args.output)
+    else:
+        build_local_bundle(args.metadata)
 
 
 if __name__ == "__main__":

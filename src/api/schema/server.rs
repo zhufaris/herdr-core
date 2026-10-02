@@ -36,4 +36,7 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Whether this server supports exact, idempotent same-Pane Agent-session rotation.
+    #[serde(default)]
+    pub agent_session_rotation_v1: bool,
 }

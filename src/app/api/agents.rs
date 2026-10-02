@@ -4,7 +4,8 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     AgentPromptModelParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
-    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
+    AgentSessionRotateV1Params, AgentSessionRotationResult, AgentStartParams, AgentTarget,
+    PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -83,6 +84,264 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    pub(super) fn handle_agent_session_rotate_v1(
+        &mut self,
+        id: String,
+        params: AgentSessionRotateV1Params,
+    ) -> String {
+        let fence_lost = |reason: &str| AgentSessionRotationResult::FenceLost {
+            operation_id: params.operation_id.clone(),
+            pane_id: params.pane_id.clone(),
+            reason: reason.into(),
+        };
+        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("pane_not_found"),
+                },
+            );
+        };
+        let Some(agent) = self.agent_info(ws_idx, pane_id) else {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("native_session_changed"),
+                },
+            );
+        };
+        if agent.terminal_id != params.expected_terminal_id {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("terminal_changed"),
+                },
+            );
+        }
+        let launch_argv = match managed_rotation_argv(&params) {
+            Ok(argv) => argv,
+            Err(reason) => {
+                return encode_success(
+                    id,
+                    ResponseResult::AgentSessionRotation {
+                        rotation: AgentSessionRotationResult::UnsupportedLaunch {
+                            operation_id: params.operation_id,
+                            pane_id: params.pane_id,
+                            reason,
+                        },
+                    },
+                );
+            }
+        };
+        let supervisor_request = crate::agent_session_supervisor::SupervisorRotationRequest {
+            operation_id: params.operation_id.clone(),
+            pane_id: params.pane_id.clone(),
+            terminal_id: params.expected_terminal_id.clone(),
+            expected_session: params.expected_session.clone(),
+            expected_state_change_seq: params.expected_state_change_seq,
+            launch_argv,
+        };
+        let supervisor_status =
+            crate::agent_session_supervisor::query_rotation(&supervisor_request);
+        if let Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Completed {
+            receipt,
+        }) = &supervisor_status
+        {
+            let rotation = if receipt.pane_id == agent.pane_id
+                && receipt.terminal_id == agent.terminal_id
+                && receipt.operation_id == params.operation_id
+            {
+                AgentSessionRotationResult::AlreadyApplied {
+                    receipt: receipt.as_ref().clone(),
+                }
+            } else {
+                AgentSessionRotationResult::Uncertain {
+                    operation_id: params.operation_id,
+                    pane_id: params.pane_id,
+                    reason: "stored_receipt_identity_mismatch".into(),
+                }
+            };
+            return encode_success(id, ResponseResult::AgentSessionRotation { rotation });
+        }
+        if matches!(
+            supervisor_status,
+            Ok(
+                crate::agent_session_supervisor::SupervisorRotationResponse::Launched
+                    | crate::agent_session_supervisor::SupervisorRotationResponse::AlreadyApplied
+            )
+        ) {
+            if let Some(new_session) = agent
+                .agent_session
+                .clone()
+                .filter(|session| session != &params.expected_session)
+            {
+                let receipt = crate::api::schema::AgentSessionRotationReceipt {
+                    operation_id: params.operation_id.clone(),
+                    pane_id: params.pane_id.clone(),
+                    terminal_id: params.expected_terminal_id.clone(),
+                    old_session: params.expected_session.clone(),
+                    new_session,
+                };
+                let rotation = match crate::agent_session_supervisor::complete_rotation(
+                    &supervisor_request,
+                    &receipt,
+                ) {
+                    Ok(
+                        crate::agent_session_supervisor::SupervisorRotationResponse::Completed {
+                            ..
+                        },
+                    ) => AgentSessionRotationResult::Rotated { receipt },
+                    Ok(_) => AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason: "receipt_not_persisted".into(),
+                    },
+                    Err(err) => AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason: format!("receipt_transport_failed:{err}"),
+                    },
+                };
+                return encode_success(id, ResponseResult::AgentSessionRotation { rotation });
+            }
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: AgentSessionRotationResult::Rotating {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                    },
+                },
+            );
+        }
+        if let Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Pending) =
+            supervisor_status
+        {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason: "supervisor_operation_interrupted".into(),
+                    },
+                },
+            );
+        }
+        if let Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Conflict) =
+            supervisor_status
+        {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("operation_id_reused"),
+                },
+            );
+        }
+        if agent.agent_session.as_ref() != Some(&params.expected_session) {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("native_session_changed"),
+                },
+            );
+        }
+        if agent.state_change_seq != params.expected_state_change_seq {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("state_changed"),
+                },
+            );
+        }
+        if agent.agent_status != crate::api::schema::AgentStatus::Idle || !agent.interactive_ready {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("agent_not_idle"),
+                },
+            );
+        }
+        if agent.name.as_deref() != Some(params.launch.name.as_str()) {
+            return encode_success(
+                id,
+                ResponseResult::AgentSessionRotation {
+                    rotation: fence_lost("agent_name_changed"),
+                },
+            );
+        }
+        let rotation = match supervisor_status {
+            Err(err) if supervisor_endpoint_is_absent(&err) => AgentSessionRotationResult::UnsupportedLaunch {
+                operation_id: params.operation_id,
+                pane_id: params.pane_id,
+                reason: "pane_not_rotatable".into(),
+            },
+            Err(err) => AgentSessionRotationResult::Uncertain {
+                operation_id: params.operation_id,
+                pane_id: params.pane_id,
+                reason: format!("supervisor_status_failed:{err}"),
+            },
+            Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Unknown) => {
+                match crate::agent_session_supervisor::request_rotation(&supervisor_request) {
+                    Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Launched
+                    | crate::agent_session_supervisor::SupervisorRotationResponse::AlreadyApplied) => {
+                        AgentSessionRotationResult::Rotating {
+                            operation_id: params.operation_id,
+                            pane_id: params.pane_id,
+                        }
+                    }
+                    Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Conflict) => {
+                        fence_lost("operation_id_reused")
+                    }
+                    Ok(crate::agent_session_supervisor::SupervisorRotationResponse::DefinitelyNotStarted {
+                        reason,
+                    }) => AgentSessionRotationResult::DefinitelyNotStarted {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason,
+                    },
+                    Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Uncertain {
+                        reason,
+                    }) => AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason,
+                    },
+                    Ok(_) => AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason: "unexpected_supervisor_response".into(),
+                    },
+                    Err(err) => AgentSessionRotationResult::Uncertain {
+                        operation_id: params.operation_id,
+                        pane_id: params.pane_id,
+                        reason: format!("supervisor_transport_failed:{err}"),
+                    },
+                }
+            }
+            Ok(crate::agent_session_supervisor::SupervisorRotationResponse::DefinitelyNotStarted {
+                reason,
+            }) => AgentSessionRotationResult::DefinitelyNotStarted {
+                operation_id: params.operation_id,
+                pane_id: params.pane_id,
+                reason,
+            },
+            Ok(crate::agent_session_supervisor::SupervisorRotationResponse::Uncertain {
+                reason,
+            }) => AgentSessionRotationResult::Uncertain {
+                operation_id: params.operation_id,
+                pane_id: params.pane_id,
+                reason,
+            },
+            Ok(_) => AgentSessionRotationResult::Uncertain {
+                operation_id: params.operation_id,
+                pane_id: params.pane_id,
+                reason: "unexpected_supervisor_state".into(),
+            },
+        };
+        encode_success(id, ResponseResult::AgentSessionRotation { rotation })
     }
 
     pub(crate) fn handle_deferred_agent_api_request(
@@ -496,6 +755,45 @@ fn agent_not_ready(id: String, target: &str) -> String {
     )
 }
 
+fn supervisor_endpoint_is_absent(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+}
+
+fn managed_rotation_argv(params: &AgentSessionRotateV1Params) -> Result<Vec<String>, String> {
+    if params.operation_id.is_empty()
+        || params.operation_id.len() > 128
+        || !params
+            .operation_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+    {
+        return Err("invalid_operation_id".into());
+    }
+    let Some(agent) = crate::detect::parse_agent_label(&params.launch.kind) else {
+        return Err("unsupported_agent_kind".into());
+    };
+    if agent != crate::detect::Agent::Traex {
+        return Err("unsupported_agent_kind".into());
+    }
+    if params
+        .launch
+        .args
+        .iter()
+        .any(|arg| arg.chars().any(char::is_control))
+    {
+        return Err("invalid_launch_argument".into());
+    }
+    let timeout = params.launch.timeout_ms.unwrap_or(30_000);
+    if timeout <= super::super::agents::AGENT_START_SETTLE_DELAY.as_millis() as u64
+        || timeout > super::super::agents::MAX_AGENT_START_TIMEOUT.as_millis() as u64
+    {
+        return Err("invalid_launch_timeout".into());
+    }
+    let mut argv = vec![crate::detect::interactive_agent_executable(agent).to_string()];
+    argv.extend(params.launch.args.iter().cloned());
+    Ok(argv)
+}
+
 fn agent_not_found(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -532,6 +830,26 @@ mod tests {
         app
     }
 
+    #[test]
+    fn only_an_absent_supervisor_endpoint_means_the_launch_is_unsupported() {
+        assert!(supervisor_endpoint_is_absent(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing socket",
+        )));
+        assert!(!supervisor_endpoint_is_absent(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "stale socket",
+        )));
+        assert!(!supervisor_endpoint_is_absent(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "live supervisor did not answer",
+        )));
+        assert!(!supervisor_endpoint_is_absent(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed supervisor response",
+        )));
+    }
+
     fn start_deferred_agent_prompt(
         app: &mut App,
         id: &str,
@@ -552,6 +870,321 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    #[tokio::test]
+    async fn session_rotation_rejects_a_legacy_launch_without_mutating_the_pane() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let now = std::time::Instant::now();
+        terminal.begin_managed_agent(
+            "orchestrator".into(),
+            Agent::Traex,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        terminal.set_detected_state(Some(Agent::Traex), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("session-old").unwrap(),
+        });
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let before = app.pane_info(0, pane_id).unwrap();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "rotate-legacy".into(),
+            method: crate::api::schema::Method::AgentSessionRotateV1(
+                crate::api::schema::AgentSessionRotateV1Params {
+                    operation_id: "clear-legacy".into(),
+                    pane_id: public_pane_id,
+                    expected_terminal_id: terminal_id.to_string(),
+                    expected_session: crate::api::schema::AgentSessionInfo {
+                        source: "herdr:traex".into(),
+                        agent: "traex".into(),
+                        kind: crate::agent_resume::AgentSessionRefKind::Id,
+                        value: "session-old".into(),
+                    },
+                    expected_state: crate::api::schema::AgentSessionRotationExpectedState::Idle,
+                    expected_state_change_seq: 0,
+                    launch: crate::api::schema::ManagedAgentLaunch {
+                        name: "orchestrator".into(),
+                        kind: "traex".into(),
+                        args: Vec::new(),
+                        timeout_ms: Some(30_000),
+                    },
+                },
+            ),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentSessionRotation { rotation } = success.result else {
+            panic!("expected session rotation response");
+        };
+        assert!(matches!(
+            rotation,
+            crate::api::schema::AgentSessionRotationResult::UnsupportedLaunch {
+                ref operation_id,
+                ref pane_id,
+                ref reason,
+            } if operation_id == "clear-legacy"
+                && pane_id == &before.pane_id
+                && reason == "pane_not_rotatable"
+        ));
+
+        let after = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(after.workspace_id, before.workspace_id);
+        assert_eq!(after.tab_id, before.tab_id);
+        assert_eq!(after.pane_id, before.pane_id);
+        assert_eq!(after.terminal_id, before.terminal_id);
+        assert_eq!(after.token, before.token);
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.agent_session, before.agent_session);
+    }
+
+    #[tokio::test]
+    async fn session_rotation_checks_exact_identity_and_idle_fences_before_launch_support() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let now = std::time::Instant::now();
+        terminal.begin_managed_agent(
+            "orchestrator".into(),
+            Agent::Traex,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        terminal.set_detected_state(Some(Agent::Traex), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("session-old").unwrap(),
+        });
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+
+        let params = |operation_id: &str| crate::api::schema::AgentSessionRotateV1Params {
+            operation_id: operation_id.into(),
+            pane_id: public_pane_id.clone(),
+            expected_terminal_id: terminal_id.to_string(),
+            expected_session: crate::api::schema::AgentSessionInfo {
+                source: "herdr:traex".into(),
+                agent: "traex".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "session-old".into(),
+            },
+            expected_state: crate::api::schema::AgentSessionRotationExpectedState::Idle,
+            expected_state_change_seq: 0,
+            launch: crate::api::schema::ManagedAgentLaunch {
+                name: "orchestrator".into(),
+                kind: "traex".into(),
+                args: Vec::new(),
+                timeout_ms: Some(30_000),
+            },
+        };
+        let rotate = |app: &mut App, params| {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "rotate".into(),
+                method: crate::api::schema::Method::AgentSessionRotateV1(params),
+            });
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::AgentSessionRotation { rotation } = success.result else {
+                panic!("expected session rotation response");
+            };
+            rotation
+        };
+
+        let mut missing_pane = params("clear-pane");
+        missing_pane.pane_id = "missing:pane".into();
+        assert!(matches!(
+            rotate(&mut app, missing_pane),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "pane_not_found"
+        ));
+
+        let mut stale_terminal = params("clear-terminal");
+        stale_terminal.expected_terminal_id = "different-terminal".into();
+        assert!(matches!(
+            rotate(&mut app, stale_terminal),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "terminal_changed"
+        ));
+
+        let mut stale_session = params("clear-session");
+        stale_session.expected_session.value = "different-session".into();
+        assert!(matches!(
+            rotate(&mut app, stale_session),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "native_session_changed"
+        ));
+
+        let mut stale_sequence = params("clear-sequence");
+        stale_sequence.expected_state_change_seq = 1;
+        assert!(matches!(
+            rotate(&mut app, stale_sequence),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "state_changed"
+        ));
+
+        let mut stale_name = params("clear-name");
+        stale_name.launch.name = "different-name".into();
+        assert!(matches!(
+            rotate(&mut app, stale_name),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "agent_name_changed"
+        ));
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Traex), AgentState::Working);
+        assert!(matches!(
+            rotate(&mut app, params("clear-working")),
+            crate::api::schema::AgentSessionRotationResult::FenceLost { reason, .. }
+                if reason == "agent_not_idle"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_rotation_recovers_the_same_receipt_without_replacing_the_pane() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read as _, Write as _};
+
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let now = std::time::Instant::now();
+        terminal.begin_managed_agent(
+            "orchestrator".into(),
+            Agent::Traex,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        terminal.set_detected_state(Some(Agent::Traex), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("session-old").unwrap(),
+        });
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let before = app.pane_info(0, pane_id).unwrap();
+        let terminal_id_text = terminal_id.to_string();
+        let endpoint = crate::agent_session_supervisor::endpoint_path(&terminal_id_text);
+        crate::ipc::prepare_socket_path(&endpoint, |_| "busy".into()).unwrap();
+        let listener = crate::ipc::bind_private_local_listener(&endpoint).unwrap();
+        let completed_receipt = crate::api::schema::AgentSessionRotationReceipt {
+            operation_id: "clear-success".into(),
+            pane_id: public_pane_id.clone(),
+            terminal_id: terminal_id_text.clone(),
+            old_session: crate::api::schema::AgentSessionInfo {
+                source: "herdr:traex".into(),
+                agent: "traex".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "session-old".into(),
+            },
+            new_session: crate::api::schema::AgentSessionInfo {
+                source: "herdr:traex".into(),
+                agent: "traex".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "session-new".into(),
+            },
+        };
+        let supervisor = std::thread::spawn({
+            let completed_receipt = completed_receipt.clone();
+            move || {
+                let responses = [
+                    serde_json::json!({"outcome": "unknown"}),
+                    serde_json::json!({"outcome": "launched"}),
+                    serde_json::json!({"outcome": "launched"}),
+                    serde_json::json!({
+                        "outcome": "completed",
+                        "receipt": completed_receipt,
+                    }),
+                ];
+                for response in responses {
+                    let mut stream = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    assert!(stream.read(&mut request).unwrap() > 0);
+                    serde_json::to_writer(&mut stream, &response).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                }
+            }
+        });
+        let params = crate::api::schema::AgentSessionRotateV1Params {
+            operation_id: "clear-success".into(),
+            pane_id: public_pane_id,
+            expected_terminal_id: terminal_id_text,
+            expected_session: completed_receipt.old_session.clone(),
+            expected_state: crate::api::schema::AgentSessionRotationExpectedState::Idle,
+            expected_state_change_seq: 0,
+            launch: crate::api::schema::ManagedAgentLaunch {
+                name: "orchestrator".into(),
+                kind: "traex".into(),
+                args: vec!["--model".into(), "default".into()],
+                timeout_ms: Some(30_000),
+            },
+        };
+
+        let first = app.handle_api_request(crate::api::schema::Request {
+            id: "rotate-first".into(),
+            method: crate::api::schema::Method::AgentSessionRotateV1(params.clone()),
+        });
+        let first: SuccessResponse = serde_json::from_str(&first).unwrap();
+        assert!(matches!(
+            first.result,
+            ResponseResult::AgentSessionRotation {
+                rotation: crate::api::schema::AgentSessionRotationResult::Rotating { .. }
+            }
+        ));
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:traex".into(),
+                agent: "traex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("session-new").unwrap(),
+            });
+        let second = app.handle_api_request(crate::api::schema::Request {
+            id: "rotate-second".into(),
+            method: crate::api::schema::Method::AgentSessionRotateV1(params),
+        });
+        let second: SuccessResponse = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            second.result,
+            ResponseResult::AgentSessionRotation {
+                rotation: crate::api::schema::AgentSessionRotationResult::Rotated {
+                    receipt: completed_receipt,
+                },
+            }
+        );
+
+        supervisor.join().unwrap();
+        let _ = std::fs::remove_file(endpoint);
+        let after = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(after.workspace_id, before.workspace_id);
+        assert_eq!(after.tab_id, before.tab_id);
+        assert_eq!(after.pane_id, before.pane_id);
+        assert_eq!(after.terminal_id, before.terminal_id);
+        assert_eq!(after.token, before.token);
+        assert_eq!(after.label, before.label);
+        assert_ne!(after.agent_session, before.agent_session);
     }
 
     #[tokio::test]

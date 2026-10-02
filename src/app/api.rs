@@ -1115,6 +1115,9 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentSessionRotateV1(params) => {
+                return self.handle_agent_session_rotate_v1(request.id, params)
+            }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,

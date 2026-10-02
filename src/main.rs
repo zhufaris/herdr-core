@@ -13,6 +13,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 
 mod agent_events;
 mod agent_resume;
+mod agent_session_supervisor;
 mod agent_view_eval;
 mod api;
 mod app;
@@ -536,6 +537,10 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+
+    if args.get(1).map(String::as_str) == Some("agent-session-supervisor") {
+        return agent_session_supervisor::run_from_args(&args[2..]);
+    }
 
     if remote_launch.is_some()
         && args.get(1).is_some()

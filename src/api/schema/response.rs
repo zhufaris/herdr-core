@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::AgentInfo;
+use super::agents::{AgentInfo, AgentSessionRotationResult};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::integrations::{
@@ -100,6 +100,9 @@ pub enum ResponseResult {
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+    },
+    AgentSessionRotation {
+        rotation: AgentSessionRotationResult,
     },
     AgentPrompted {
         agent: AgentInfo,

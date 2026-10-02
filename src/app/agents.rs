@@ -146,6 +146,7 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        let rotatable = params.rotatable;
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -196,7 +197,36 @@ impl App {
 
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
         argv.extend(params.args);
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+        let command_argv = if rotatable {
+            #[cfg(not(unix))]
+            {
+                return Err(AgentStartError::SupervisorUnavailable(
+                    "same-Pane Agent session rotation is unavailable on this platform".into(),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                if kind != crate::detect::Agent::Traex {
+                    return Err(AgentStartError::UnsupportedRotatableKind(params.kind));
+                }
+                let executable = std::env::current_exe()
+                    .map_err(|err| AgentStartError::SupervisorUnavailable(err.to_string()))?;
+                let mut supervised = vec![
+                    executable.to_string_lossy().into_owned(),
+                    "agent-session-supervisor".into(),
+                    "--pane-id".into(),
+                    params.pane_id.clone(),
+                    "--terminal-id".into(),
+                    terminal_id.to_string(),
+                    "--".into(),
+                ];
+                supervised.extend(argv.iter().cloned());
+                supervised
+            }
+        } else {
+            argv.clone()
+        };
+        let command = crate::platform::interactive_shell_command(&command_argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
@@ -243,6 +273,14 @@ impl App {
             AgentStartError::UnsupportedKind(kind) => crate::api::schema::ErrorBody {
                 code: "unsupported_agent_kind".into(),
                 message: format!("unsupported interactive agent kind {kind}"),
+            },
+            AgentStartError::UnsupportedRotatableKind(kind) => crate::api::schema::ErrorBody {
+                code: "unsupported_rotatable_agent_kind".into(),
+                message: format!("interactive agent kind {kind} cannot use rotatable launch"),
+            },
+            AgentStartError::SupervisorUnavailable(message) => crate::api::schema::ErrorBody {
+                code: "agent_supervisor_unavailable".into(),
+                message,
             },
             AgentStartError::InvalidArgument => crate::api::schema::ErrorBody {
                 code: "invalid_agent_argument".into(),
@@ -449,6 +487,8 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 pub(super) enum AgentStartError {
     InvalidName,
     UnsupportedKind(String),
+    UnsupportedRotatableKind(String),
+    SupervisorUnavailable(String),
     InvalidArgument,
     InvalidTimeout,
     TargetNotFound(String),

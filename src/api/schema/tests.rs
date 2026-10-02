@@ -123,11 +123,13 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
+            rotatable: true,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
     assert_eq!(start_json["method"], "agent.start");
     assert_eq!(start_json["params"]["pane_id"], "w1:p2");
+    assert_eq!(start_json["params"]["rotatable"], true);
     assert_eq!(
         serde_json::from_value::<Request>(start_json).unwrap(),
         start
@@ -178,6 +180,134 @@ fn agent_start_and_prompt_requests_round_trip() {
     assert_eq!(
         serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
         prompt_and_wait
+    );
+}
+
+#[test]
+fn agent_session_rotation_v1_contract_round_trips() {
+    let request = Request {
+        id: "rotate".into(),
+        method: Method::AgentSessionRotateV1(AgentSessionRotateV1Params {
+            operation_id: "clear-42".into(),
+            pane_id: "w1:p2".into(),
+            expected_terminal_id: "term-7".into(),
+            expected_session: AgentSessionInfo {
+                source: "herdr:traex".into(),
+                agent: "traex".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "session-old".into(),
+            },
+            expected_state: AgentSessionRotationExpectedState::Idle,
+            expected_state_change_seq: 17,
+            launch: ManagedAgentLaunch {
+                name: "orchestrator".into(),
+                kind: "traex".into(),
+                args: vec!["--model".into(), "default".into()],
+                timeout_ms: Some(30_000),
+            },
+        }),
+    };
+
+    let request_json = serde_json::to_value(&request).unwrap();
+    assert_eq!(request_json["method"], "agent.session_rotate.v1");
+    assert_eq!(request_json["params"]["operation_id"], "clear-42");
+    assert_eq!(request_json["params"]["expected_state"], "idle");
+    assert_eq!(request_json["params"]["expected_state_change_seq"], 17);
+    assert_eq!(request_json["params"]["launch"]["kind"], "traex");
+    assert_eq!(
+        serde_json::from_value::<Request>(request_json).unwrap(),
+        request
+    );
+
+    let completed = AgentSessionRotationReceipt {
+        operation_id: "clear-42".into(),
+        pane_id: "w1:p2".into(),
+        terminal_id: "term-7".into(),
+        old_session: AgentSessionInfo {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "session-old".into(),
+        },
+        new_session: AgentSessionInfo {
+            source: "herdr:traex".into(),
+            agent: "traex".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "session-new".into(),
+        },
+    };
+    let outcomes = [
+        AgentSessionRotationResult::Rotated {
+            receipt: completed.clone(),
+        },
+        AgentSessionRotationResult::AlreadyApplied { receipt: completed },
+        AgentSessionRotationResult::FenceLost {
+            operation_id: "clear-43".into(),
+            pane_id: "w1:p2".into(),
+            reason: "native_session_changed".into(),
+        },
+        AgentSessionRotationResult::UnsupportedLaunch {
+            operation_id: "clear-44".into(),
+            pane_id: "w1:p2".into(),
+            reason: "pane_not_rotatable".into(),
+        },
+        AgentSessionRotationResult::DefinitelyNotStarted {
+            operation_id: "clear-45".into(),
+            pane_id: "w1:p2".into(),
+            reason: "launch_rejected".into(),
+        },
+        AgentSessionRotationResult::Rotating {
+            operation_id: "clear-46".into(),
+            pane_id: "w1:p2".into(),
+        },
+        AgentSessionRotationResult::Uncertain {
+            operation_id: "clear-47".into(),
+            pane_id: "w1:p2".into(),
+            reason: "supervisor_reply_lost".into(),
+        },
+    ];
+
+    for outcome in outcomes {
+        let response = SuccessResponse {
+            id: "rotate".into(),
+            result: ResponseResult::AgentSessionRotation { rotation: outcome },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["result"]["type"], "agent_session_rotation");
+        assert!(json["result"]["rotation"]["outcome"].is_string());
+        assert_eq!(
+            serde_json::from_value::<SuccessResponse>(json).unwrap(),
+            response
+        );
+    }
+
+    let legacy_start: Request = serde_json::from_value(serde_json::json!({
+        "id": "legacy-start",
+        "method": "agent.start",
+        "params": {
+            "name": "reviewer",
+            "kind": "pi",
+            "pane_id": "w1:p2"
+        }
+    }))
+    .unwrap();
+    let Method::AgentStart(legacy_start) = legacy_start.method else {
+        panic!("expected agent.start");
+    };
+    assert!(!legacy_start.rotatable);
+
+    let capabilities = ServerCapabilities {
+        live_handoff: true,
+        detached_server_daemon: true,
+        endpoint_protocol_generation: Some(1),
+        surface_interest: true,
+        health_check: true,
+        ssh_agent_registration: false,
+        agent_session_rotation_v1: true,
+    };
+    assert_eq!(
+        serde_json::to_value(capabilities).unwrap()["agent_session_rotation_v1"],
+        true
     );
 }
 
@@ -777,6 +907,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_session_rotation_v1: true,
             }),
         },
     };

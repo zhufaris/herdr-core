@@ -77,6 +77,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_session_rotation_v1: cfg!(unix),
     })
 }
 
@@ -812,6 +813,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentSessionRotateV1(_) => "agent.session_rotate.v1",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentPromptModel(_) => "agent.prompt_model",
         Method::AgentWait(_) => "agent.wait",
@@ -1659,6 +1661,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_session_rotation_v1: true,
             }),
             None,
             None,

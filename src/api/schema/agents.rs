@@ -173,6 +173,81 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Launch this Agent under the same-Pane session supervisor.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub rotatable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSessionRotateV1Params {
+    pub operation_id: String,
+    pub pane_id: String,
+    pub expected_terminal_id: String,
+    pub expected_session: AgentSessionInfo,
+    pub expected_state: AgentSessionRotationExpectedState,
+    pub expected_state_change_seq: u64,
+    pub launch: ManagedAgentLaunch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionRotationExpectedState {
+    Idle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManagedAgentLaunch {
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSessionRotationReceipt {
+    pub operation_id: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub old_session: AgentSessionInfo,
+    pub new_session: AgentSessionInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AgentSessionRotationResult {
+    Rotated {
+        receipt: AgentSessionRotationReceipt,
+    },
+    AlreadyApplied {
+        receipt: AgentSessionRotationReceipt,
+    },
+    FenceLost {
+        operation_id: String,
+        pane_id: String,
+        reason: String,
+    },
+    UnsupportedLaunch {
+        operation_id: String,
+        pane_id: String,
+        reason: String,
+    },
+    DefinitelyNotStarted {
+        operation_id: String,
+        pane_id: String,
+        reason: String,
+    },
+    Rotating {
+        operation_id: String,
+        pane_id: String,
+    },
+    Uncertain {
+        operation_id: String,
+        pane_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

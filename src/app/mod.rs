@@ -2831,6 +2831,7 @@ mod tests {
                 pane_id,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
+                rotatable: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2873,6 +2874,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
+                rotatable: false,
             }),
         };
         let response = app.handle_api_request(request());
@@ -2922,6 +2924,52 @@ mod tests {
             app.state.terminals[&terminal_id].agent_name.as_deref(),
             Some("worker")
         );
+    }
+
+    #[tokio::test]
+    async fn rotatable_agent_start_launches_the_pane_supervisor_instead_of_raw_traex() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("rotatable-agent-start");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, mut receiver) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "start-rotatable".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "orchestrator".into(),
+                kind: "traex".into(),
+                pane_id: pane_id.clone(),
+                args: vec!["--model".into(), "default".into()],
+                timeout_ms: Some(30_000),
+                rotatable: true,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            response["result"]["argv"],
+            serde_json::json!(["traex", "--model", "default"])
+        );
+
+        let submitted = receiver.try_recv().unwrap();
+        let submitted = String::from_utf8(submitted.to_vec()).unwrap();
+        assert!(
+            submitted.contains("agent-session-supervisor"),
+            "{submitted}"
+        );
+        assert!(submitted.contains(&pane_id), "{submitted}");
+        assert!(submitted.contains(&terminal_id.to_string()), "{submitted}");
+        assert!(submitted.contains("traex"), "{submitted}");
+        assert!(submitted.ends_with('\r'));
     }
 
     #[test]

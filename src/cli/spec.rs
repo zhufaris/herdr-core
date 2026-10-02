@@ -447,6 +447,10 @@ fn agent_command() -> Command {
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
                 )
                 .arg(
+                    flag("rotatable")
+                        .help("Launch TraeX under the same-Pane session rotation supervisor"),
+                )
+                .arg(
                     Arg::new("agent_args")
                         .value_name("AGENT_ARG")
                         .num_args(0..)
@@ -454,6 +458,38 @@ fn agent_command() -> Command {
                 )
                 .after_help(
                     "The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait",
+                ),
+        )
+        .subcommand(
+            Command::new("session-rotate")
+                .about("Rotate a supervised Agent session in the same pane")
+                .override_usage(
+                    "herdr agent session-rotate --operation-id <ID> --pane <ID> --expected-terminal-id <ID> --expected-session-source <SOURCE> --expected-session-agent <AGENT> --expected-session-kind <KIND> --expected-session-value <VALUE> --expected-state-change-seq <SEQ> --name <NAME> --kind <KIND> [OPTIONS] [-- [AGENT_ARG]...]",
+                )
+                .arg(option("operation-id", "ID").required(true))
+                .arg(option("pane", "ID").required(true))
+                .arg(option("expected-terminal-id", "ID").required(true))
+                .arg(option("expected-session-source", "SOURCE").required(true))
+                .arg(option("expected-session-agent", "AGENT").required(true))
+                .arg(
+                    option("expected-session-kind", "KIND")
+                        .required(true)
+                        .value_parser(["id", "path"]),
+                )
+                .arg(option("expected-session-value", "VALUE").required(true))
+                .arg(option("expected-state-change-seq", "SEQ").required(true))
+                .arg(option("name", "NAME").required(true))
+                .arg(
+                    option("kind", "KIND")
+                        .required(true)
+                        .value_parser(agent_kind_values()),
+                )
+                .arg(option("timeout", "MS"))
+                .arg(
+                    Arg::new("agent_args")
+                        .value_name("AGENT_ARG")
+                        .num_args(0..)
+                        .last(true),
                 ),
         )
         .subcommand(
@@ -1335,10 +1371,38 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
+        assert!(has_option(agent_start, "rotatable"));
         for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }
         assert!(agent_start
+            .get_arguments()
+            .any(|arg| arg.get_id() == "agent_args"));
+    }
+
+    #[test]
+    fn spec_models_exact_agent_session_rotation_fences() {
+        let cmd = super::command();
+        let rotate = command_path(&cmd, &["agent", "session-rotate"]);
+        for option in [
+            "operation-id",
+            "pane",
+            "expected-terminal-id",
+            "expected-session-source",
+            "expected-session-agent",
+            "expected-session-kind",
+            "expected-session-value",
+            "expected-state-change-seq",
+            "name",
+            "kind",
+        ] {
+            assert!(has_option(rotate, option), "missing --{option}");
+        }
+        assert_eq!(
+            option_values(rotate, "expected-session-kind"),
+            ["id", "path"]
+        );
+        assert!(rotate
             .get_arguments()
             .any(|arg| arg.get_id() == "agent_args"));
     }

@@ -1556,6 +1556,79 @@
           ],
           "type": "object"
         },
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
+        },
+        "AgentSessionRotateV1Params": {
+          "properties": {
+            "expected_session": {
+              "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+            },
+            "expected_state": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRotationExpectedState"
+            },
+            "expected_state_change_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "launch": {
+              "$ref": "#/schemas/request/$defs/ManagedAgentLaunch"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id",
+            "pane_id",
+            "expected_terminal_id",
+            "expected_session",
+            "expected_state",
+            "expected_state_change_seq",
+            "launch"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRotationExpectedState": {
+          "enum": [
+            "idle"
+          ],
+          "type": "string"
+        },
         "AgentStartParams": {
           "properties": {
             "args": {
@@ -1572,6 +1645,10 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "rotatable": {
+              "description": "Launch this Agent under the same-Pane session supervisor.",
+              "type": "boolean"
             },
             "timeout_ms": {
               "description": "Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.",
@@ -2569,6 +2646,36 @@
           "required": [
             "path",
             "ratio"
+          ],
+          "type": "object"
+        },
+        "ManagedAgentLaunch": {
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "description": "Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "kind"
           ],
           "type": "object"
         },
@@ -5629,6 +5736,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.session_rotate.v1",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRotateV1Params"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.prompt",
               "type": "string"
             },
@@ -7294,6 +7417,185 @@
             "path"
           ],
           "type": "string"
+        },
+        "AgentSessionRotationReceipt": {
+          "properties": {
+            "new_session": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionInfo"
+            },
+            "old_session": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionInfo"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id",
+            "pane_id",
+            "terminal_id",
+            "old_session",
+            "new_session"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRotationResult": {
+          "oneOf": [
+            {
+              "properties": {
+                "outcome": {
+                  "const": "rotated",
+                  "type": "string"
+                },
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionRotationReceipt"
+                }
+              },
+              "required": [
+                "outcome",
+                "receipt"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "already_applied",
+                  "type": "string"
+                },
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionRotationReceipt"
+                }
+              },
+              "required": [
+                "outcome",
+                "receipt"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "const": "fence_lost",
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "operation_id",
+                "pane_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "const": "unsupported_launch",
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "operation_id",
+                "pane_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "const": "definitely_not_started",
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "operation_id",
+                "pane_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "const": "rotating",
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "operation_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "const": "uncertain",
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "operation_id",
+                "pane_id",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "AgentStatus": {
           "enum": [
@@ -10267,6 +10569,22 @@
             },
             {
               "properties": {
+                "rotation": {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionRotationResult"
+                },
+                "type": {
+                  "const": "agent_session_rotation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "rotation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
@@ -11458,6 +11776,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_session_rotation_v1": {
+              "default": false,
+              "description": "Whether this server supports exact, idempotent same-Pane Agent-session rotation.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

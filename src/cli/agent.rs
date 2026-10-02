@@ -2,9 +2,10 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptModelParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
-    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
-    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
-    ReadSource, Request,
+    AgentRenameParams, AgentSendKeysParams, AgentSessionInfo, AgentSessionRotateV1Params,
+    AgentSessionRotationExpectedState, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams,
+    ErrorBody, ErrorResponse, ManagedAgentLaunch, Method, PaneProcessInfoParams, PaneTarget,
+    ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -28,6 +29,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "session-rotate" => agent_session_rotate(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -38,6 +40,104 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn agent_session_rotate(args: &[String]) -> std::io::Result<i32> {
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut values = std::collections::HashMap::new();
+    let mut timeout_ms = None;
+    let mut expected_state_change_seq = None;
+    let mut index = 0;
+    while index < separator {
+        let option = args[index].as_str();
+        let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+            eprintln!("missing value for {option}");
+            return Ok(2);
+        };
+        match option {
+            "--timeout" => {
+                timeout_ms = match parse_timeout(value) {
+                    Ok(value) => Some(value),
+                    Err(code) => return Ok(code),
+                };
+            }
+            "--expected-state-change-seq" => match value.parse::<u64>() {
+                Ok(value) => expected_state_change_seq = Some(value),
+                Err(_) => {
+                    eprintln!("invalid --expected-state-change-seq: {value}");
+                    return Ok(2);
+                }
+            },
+            "--operation-id"
+            | "--pane"
+            | "--expected-terminal-id"
+            | "--expected-session-source"
+            | "--expected-session-agent"
+            | "--expected-session-kind"
+            | "--expected-session-value"
+            | "--name"
+            | "--kind" => {
+                values.insert(option, value.clone());
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+        index += 2;
+    }
+    let required = |name: &'static str| {
+        values.get(name).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("missing required {name}"),
+            )
+        })
+    };
+    let expected_session_kind = match required("--expected-session-kind")?.as_str() {
+        "id" => crate::agent_resume::AgentSessionRefKind::Id,
+        "path" => crate::agent_resume::AgentSessionRefKind::Path,
+        value => {
+            eprintln!("invalid --expected-session-kind: {value}");
+            return Ok(2);
+        }
+    };
+    let agent_args = if separator < args.len() {
+        args[separator + 1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let request = Request {
+        id: "cli:agent:session-rotate".into(),
+        method: Method::AgentSessionRotateV1(AgentSessionRotateV1Params {
+            operation_id: required("--operation-id")?,
+            pane_id: super::normalize_pane_id(&required("--pane")?),
+            expected_terminal_id: required("--expected-terminal-id")?,
+            expected_session: AgentSessionInfo {
+                source: required("--expected-session-source")?,
+                agent: required("--expected-session-agent")?,
+                kind: expected_session_kind,
+                value: required("--expected-session-value")?,
+            },
+            expected_state: AgentSessionRotationExpectedState::Idle,
+            expected_state_change_seq: expected_state_change_seq.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing required --expected-state-change-seq",
+                )
+            })?,
+            launch: ManagedAgentLaunch {
+                name: required("--name")?,
+                kind: required("--kind")?,
+                args: agent_args,
+                timeout_ms,
+            },
+        }),
+    };
+    super::print_response(&super::send_request(&request)?)
 }
 
 fn agent_explain(args: &[String]) -> std::io::Result<i32> {
@@ -290,7 +390,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [--rotatable] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -300,6 +400,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut rotatable = false;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
@@ -329,6 +430,10 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Err(exit_code) => return Ok(exit_code),
                 };
                 index += 2;
+            }
+            "--rotatable" => {
+                rotatable = true;
+                index += 1;
             }
             other => {
                 eprintln!("unknown option: {other}");
@@ -379,6 +484,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                rotatable,
             }),
         })?;
         if response.get("error").is_none() {
@@ -995,7 +1101,10 @@ fn print_agent_help() {
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [--rotatable] [-- <agent-args...>]"
+    );
+    eprintln!(
+        "  herdr agent session-rotate --operation-id ID --pane ID --expected-terminal-id ID --expected-session-source SOURCE --expected-session-agent AGENT --expected-session-kind KIND --expected-session-value VALUE --expected-state-change-seq SEQ --name NAME --kind KIND [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(

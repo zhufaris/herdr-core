@@ -126,6 +126,22 @@ pub enum ResponseResult {
         #[serde(flatten)]
         boundary: super::agent_events::AgentEventsTurnCursor,
     },
+    AgentEventsCapabilities {
+        #[serde(flatten)]
+        capabilities: super::agent_events::AgentEventsCapabilities,
+    },
+    AgentEventsSubmissionReceipt {
+        #[serde(flatten)]
+        receipt: super::agent_events::AgentEventsSubmissionReceipt,
+    },
+    AgentEventsRecoveryBatch {
+        #[serde(flatten)]
+        batch: super::agent_events::AgentEventsRecoveryBatch,
+    },
+    AgentEventsTurnList {
+        #[serde(flatten)]
+        turns: super::agent_events::AgentEventsTurnList,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

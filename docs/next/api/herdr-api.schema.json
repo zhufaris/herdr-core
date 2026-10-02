@@ -1270,6 +1270,35 @@
           ],
           "type": "object"
         },
+        "AgentEventsListTurnsParams": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_kind": {
+              "$ref": "#/schemas/request/$defs/TranscriptKind"
+            },
+            "limit": {
+              "default": 64,
+              "format": "uint32",
+              "maximum": 128,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_kind",
+            "session_id"
+          ],
+          "type": "object"
+        },
         "AgentEventsLocateParams": {
           "additionalProperties": false,
           "properties": {
@@ -1318,6 +1347,55 @@
           "required": [
             "source_id",
             "after"
+          ],
+          "type": "object"
+        },
+        "AgentEventsRecoverTurnParams": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_kind": {
+              "$ref": "#/schemas/request/$defs/TranscriptKind"
+            },
+            "limit": {
+              "default": 64,
+              "format": "uint32",
+              "maximum": 128,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "started_at": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_kind",
+            "session_id",
+            "turn_id",
+            "started_at"
+          ],
+          "type": "object"
+        },
+        "AgentEventsSubmissionParams": {
+          "additionalProperties": false,
+          "properties": {
+            "submission_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "submission_id"
           ],
           "type": "object"
         },
@@ -6271,6 +6349,70 @@
         {
           "properties": {
             "method": {
+              "const": "agent.events.capabilities",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.submission",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsSubmissionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.recover_turn",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsRecoverTurnParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.events.turns",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentEventsListTurnsParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.events.subscribe",
               "type": "string"
             },
@@ -6827,6 +6969,56 @@
             "checkpoint_offset",
             "earliest_cursor",
             "latest_cursor"
+          ],
+          "type": "object"
+        },
+        "AgentEventsRecoveryOutcome": {
+          "enum": [
+            "recovered",
+            "indexing",
+            "not_found",
+            "ambiguous"
+          ],
+          "type": "string"
+        },
+        "AgentEventsSubmissionState": {
+          "enum": [
+            "prepared",
+            "observed",
+            "terminal",
+            "cancelled",
+            "legacy_unavailable"
+          ],
+          "type": "string"
+        },
+        "AgentEventsTurnSummary": {
+          "properties": {
+            "has_human_message": {
+              "type": "boolean"
+            },
+            "started_at": {
+              "type": "string"
+            },
+            "submission_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_state": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "turn_id",
+            "started_at",
+            "has_human_message"
           ],
           "type": "object"
         },
@@ -7819,6 +8011,17 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "layout_updated"
+          ],
+          "type": "string"
+        },
+        "GoalStatus": {
+          "enum": [
+            "active",
+            "paused",
+            "blocked",
+            "completed",
+            "budget_limited",
+            "usage_limited"
           ],
           "type": "string"
         },
@@ -9667,6 +9870,40 @@
             },
             {
               "properties": {
+                "goal_id": {
+                  "type": "string"
+                },
+                "objective": {
+                  "type": "string"
+                },
+                "source_updated_at": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "$ref": "#/schemas/success_response/$defs/GoalStatus"
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "goal_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "goal_id",
+                "objective",
+                "status",
+                "source_updated_at",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "parent_id": {
                   "type": [
                     "string",
@@ -10173,6 +10410,142 @@
                 "source_id",
                 "found",
                 "after_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "exact_turn_recovery_v1": {
+                  "type": "boolean"
+                },
+                "historical_turn_index_recovery_v1": {
+                  "type": "boolean"
+                },
+                "session_turn_enumeration_v1": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "agent_events_capabilities",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "exact_turn_recovery_v1",
+                "historical_turn_index_recovery_v1",
+                "session_turn_enumeration_v1"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_kind": {
+                  "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
+                },
+                "submission_id": {
+                  "type": "string"
+                },
+                "terminal_state": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "agent_events_submission_receipt",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "submission_id",
+                "state",
+                "agent_kind",
+                "session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "canonical_started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "complete": {
+                  "type": "boolean"
+                },
+                "events": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentReplyEvent"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/AgentEventsRecoveryOutcome"
+                },
+                "type": {
+                  "const": "agent_events_recovery_batch",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "outcome",
+                "events",
+                "next_cursor",
+                "complete"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "complete": {
+                  "type": "boolean"
+                },
+                "next_cursor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "turns": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentEventsTurnSummary"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_events_turn_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "turns",
+                "complete"
               ],
               "type": "object"
             },

@@ -1,5 +1,5 @@
 use super::{digest, EventError, Result};
-use crate::api::schema::agent_events::{ReplyPayload, TranscriptKind};
+use crate::api::schema::agent_events::{GoalStatus, ReplyPayload, TranscriptKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -245,6 +245,52 @@ impl Decoder {
                         ));
                     }
                     self.traex_turn_active = false;
+                }
+                Some("thread_goal_updated") => {
+                    if self.awaiting_turn_boundary {
+                        return Ok(());
+                    }
+                    let goal = p.get("goal").ok_or(EventError("invalid_record"))?;
+                    let thread_id = required(goal, "threadId")?;
+                    if p.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+                        return Err(EventError("goal_thread_identity_mismatch"));
+                    }
+                    let objective = goal["objective"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or(EventError("invalid_record"))?;
+                    let created_at = goal["createdAt"]
+                        .as_u64()
+                        .ok_or(EventError("invalid_record"))?;
+                    let source_updated_at = goal["updatedAt"]
+                        .as_u64()
+                        .filter(|value| *value >= created_at)
+                        .ok_or(EventError("invalid_record"))?;
+                    let (status, status_key) = match goal["status"].as_str() {
+                        Some("active") => (GoalStatus::Active, "active"),
+                        Some("paused") => (GoalStatus::Paused, "paused"),
+                        Some("blocked") => (GoalStatus::Blocked, "blocked"),
+                        Some("complete") => (GoalStatus::Completed, "completed"),
+                        Some("budget_limited") => (GoalStatus::BudgetLimited, "budget_limited"),
+                        Some("usage_limited") => (GoalStatus::UsageLimited, "usage_limited"),
+                        _ => return Err(EventError("invalid_goal_status")),
+                    };
+                    let (objective, truncated) = bounded(objective);
+                    let goal_id = digest(format!("{thread_id}:{created_at}").as_bytes());
+                    let transition = digest(
+                        format!("{goal_id}:{source_updated_at}:{status_key}:{objective}")
+                            .as_bytes(),
+                    );
+                    out.push((
+                        format!("goal:{goal_id}:{transition}"),
+                        ReplyPayload::GoalChanged {
+                            goal_id,
+                            objective,
+                            status,
+                            source_updated_at,
+                            truncated,
+                        },
+                    ));
                 }
                 Some(_) => {}
                 None => return Err(EventError("invalid_record")),
@@ -616,6 +662,106 @@ mod tests {
         );
         assert!(
             matches!(&events[1].payload, ReplyPayload::ToolResult { call_id, text, .. } if call_id == "call-1" && text == "passed")
+        );
+    }
+    #[test]
+    fn traex_projects_native_goal_updates_without_parsing_exec() {
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
+            )
+            .unwrap();
+
+        let events = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"thread_goal_updated",
+                        "threadId":"thread-1",
+                        "goal":{
+                            "threadId":"thread-1",
+                            "objective":"Ship the feature",
+                            "status":"blocked",
+                            "tokensUsed":42,
+                            "timeUsedSeconds":5,
+                            "createdAt":100,
+                            "updatedAt":101
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].payload,
+            ReplyPayload::GoalChanged {
+                objective,
+                status: GoalStatus::Blocked,
+                source_updated_at: 101,
+                truncated: false,
+                ..
+            } if objective == "Ship the feature"
+        ));
+        assert_eq!(events[0].turn.as_deref(), Some("t"));
+
+        let exec = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"tool","call_id":"call-1","name":"exec","input":"tools.update_goal({ status: 'complete' })"}}),
+            )
+            .unwrap();
+        assert_eq!(exec.len(), 1);
+        assert!(matches!(exec[0].payload, ReplyPayload::ToolCall { .. }));
+    }
+
+    #[test]
+    fn traex_goal_updates_fail_closed_on_invalid_identity_status_and_time() {
+        let base = json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"thread_goal_updated",
+                "threadId":"thread-1",
+                "goal":{
+                    "threadId":"thread-1",
+                    "objective":"Ship the feature",
+                    "status":"active",
+                    "createdAt":100,
+                    "updatedAt":101
+                }
+            }
+        });
+        let mut decoder = Decoder::default();
+
+        let mut mismatched = base.clone();
+        mismatched["payload"]["goal"]["threadId"] = json!("thread-2");
+        assert_eq!(
+            decoder
+                .decode(TranscriptKind::Traex, &mismatched)
+                .unwrap_err()
+                .0,
+            "goal_thread_identity_mismatch"
+        );
+
+        let mut unknown = base.clone();
+        unknown["payload"]["goal"]["status"] = json!("unknown");
+        assert_eq!(
+            decoder
+                .decode(TranscriptKind::Traex, &unknown)
+                .unwrap_err()
+                .0,
+            "invalid_goal_status"
+        );
+
+        let mut stale = base;
+        stale["payload"]["goal"]["updatedAt"] = json!(99);
+        assert_eq!(
+            decoder.decode(TranscriptKind::Traex, &stale).unwrap_err().0,
+            "invalid_record"
         );
     }
     #[test]

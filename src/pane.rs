@@ -21,7 +21,9 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
-use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
+use crate::pty::actor::{
+    PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadBatch, PtyReadResult,
+};
 use crate::render_signal::RenderSignal;
 
 mod agent_detection;
@@ -43,7 +45,7 @@ use self::agent_detection::{
 pub(crate) use self::state::PANE_TOKEN_SPACE;
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
-use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
+use self::terminal::{GhosttyPaneTerminal, PaneTerminal, ProcessBytesResult};
 pub(crate) use self::terminal::{
     TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
     TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
@@ -2440,20 +2442,29 @@ impl PaneRuntime {
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
-            let on_read = Box::new(move |bytes: &[u8]| {
+            let on_read = Box::new(move |batch: PtyReadBatch<'_>| {
+                let batch_started = crate::render_prof::timer();
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
-                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                let mut result = ProcessBytesResult::default();
+                for bytes in batch.chunks() {
+                    result.merge(terminal.process_pty_bytes(
+                        pane_id,
+                        shell_pid,
+                        bytes,
+                        &response_writer,
+                    ));
+                }
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                crate::render_prof::duration_since("pty.batch_callback", batch_started);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
-                observe_detection_content_change(bytes, &detection_content_seq);
+                observe_detection_content_change(batch.bytes(), &detection_content_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
@@ -2642,21 +2653,30 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
-            let on_read = Box::new(move |bytes: &[u8]| {
+            let on_read = Box::new(move |batch: PtyReadBatch<'_>| {
+                let batch_started = crate::render_prof::timer();
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
-                    terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                let mut result = ProcessBytesResult::default();
+                for bytes in batch.chunks() {
+                    result.merge(terminal.process_pty_bytes(
+                        pane_id,
+                        shell_pid,
+                        bytes,
+                        &response_writer,
+                    ));
+                }
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                crate::render_prof::duration_since("pty.batch_callback", batch_started);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
-                    observe_detection_content_change(bytes, &detection_content_seq);
+                    observe_detection_content_change(batch.bytes(), &detection_content_seq);
                 }
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);

@@ -19,7 +19,26 @@ mod windows {
         pub terminal_responses: Vec<Bytes>,
     }
 
-    type ReadCallback = Box<dyn FnMut(&[u8]) -> PtyReadResult + Send + 'static>;
+    #[derive(Clone, Copy)]
+    pub(crate) struct PtyReadBatch<'a> {
+        bytes: &'a [u8],
+    }
+
+    impl<'a> PtyReadBatch<'a> {
+        fn single(bytes: &'a [u8]) -> Self {
+            Self { bytes }
+        }
+
+        pub(crate) fn bytes(self) -> &'a [u8] {
+            self.bytes
+        }
+
+        pub(crate) fn chunks(self) -> impl Iterator<Item = &'a [u8]> {
+            std::iter::once(self.bytes)
+        }
+    }
+
+    type ReadCallback = Box<dyn FnMut(PtyReadBatch<'_>) -> PtyReadResult + Send + 'static>;
     type ReaderExitCallback = Box<dyn FnOnce() + Send + 'static>;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +253,7 @@ mod windows {
                                 let _order = response_order
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let result = on_read(&buf[..n]);
+                                let result = on_read(PtyReadBatch::single(&buf[..n]));
                                 if result.terminal_responses.into_iter().any(|response| {
                                     write_tx.send(PtyIoWriteCommand::Write(response)).is_err()
                                 }) {

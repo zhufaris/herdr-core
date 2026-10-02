@@ -5,8 +5,10 @@ use crate::agent_events::{
     EventError, Journal, RegisteredSource, SourceReader, SubmissionPrepareResult,
 };
 use crate::api::schema::agent_events::{
-    AgentEventsAttachParams, AgentEventsBatch, AgentEventsLocateParams, AgentEventsReadParams,
-    AgentEventsTurnCursor, TranscriptKind,
+    AgentEventsAttachParams, AgentEventsBatch, AgentEventsCapabilities, AgentEventsListTurnsParams,
+    AgentEventsLocateParams, AgentEventsReadParams, AgentEventsRecoverTurnParams,
+    AgentEventsRecoveryBatch, AgentEventsSubmissionParams, AgentEventsSubmissionReceipt,
+    AgentEventsTurnCursor, AgentEventsTurnList, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, PaneProcessInfoParams, Request, ResponseResult};
 use crate::api::ApiRequestSender;
@@ -159,6 +161,37 @@ impl ReplyStreams {
             }),
             result => result,
         }
+    }
+
+    pub fn capabilities(&self) -> ResponseResult {
+        ResponseResult::AgentEventsCapabilities {
+            capabilities: AgentEventsCapabilities {
+                exact_turn_recovery_v1: true,
+                historical_turn_index_recovery_v1: true,
+                session_turn_enumeration_v1: true,
+            },
+        }
+    }
+
+    pub fn submission(
+        &self,
+        params: &AgentEventsSubmissionParams,
+    ) -> crate::agent_events::Result<AgentEventsSubmissionReceipt> {
+        self.with_journal(false, |journal| journal.submission(params))
+    }
+
+    pub fn recover_turn(
+        &self,
+        params: &AgentEventsRecoverTurnParams,
+    ) -> crate::agent_events::Result<AgentEventsRecoveryBatch> {
+        self.with_journal(false, |journal| journal.recover_turn(params))
+    }
+
+    pub fn turns(
+        &self,
+        params: &AgentEventsListTurnsParams,
+    ) -> crate::agent_events::Result<AgentEventsTurnList> {
+        self.with_journal(false, |journal| journal.turns(params))
     }
 
     pub fn prepare_submission(

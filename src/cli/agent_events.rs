@@ -1,6 +1,7 @@
 use crate::api::schema::agent_events::{
-    AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsLocateParams, AgentEventsReadParams,
-    AgentEventsTurnBoundary, TranscriptKind,
+    AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsListTurnsParams,
+    AgentEventsLocateParams, AgentEventsReadParams, AgentEventsRecoverTurnParams,
+    AgentEventsSubmissionParams, AgentEventsTurnBoundary, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -22,6 +23,84 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     let get = |key: &str| values.get(key).copied();
     let method = match action {
         "sources" if options.is_empty() => Method::AgentEventsSources(EmptyParams {}),
+        "capabilities" if options.is_empty() => Method::AgentEventsCapabilities(EmptyParams {}),
+        "submission" => {
+            if values.keys().any(|key| *key != "--submission-id") {
+                return help();
+            }
+            let Some(submission_id) = get("--submission-id") else {
+                return help();
+            };
+            Method::AgentEventsSubmission(AgentEventsSubmissionParams {
+                submission_id: submission_id.into(),
+            })
+        }
+        "recover-turn" => {
+            if values.keys().any(|key| {
+                ![
+                    "--kind",
+                    "--session-id",
+                    "--turn-id",
+                    "--started-at",
+                    "--after",
+                    "--limit",
+                ]
+                .contains(key)
+            }) {
+                return help();
+            }
+            let (Some(kind), Some(session_id), Some(turn_id), Some(started_at)) = (
+                get("--kind"),
+                get("--session-id"),
+                get("--turn-id"),
+                get("--started-at"),
+            ) else {
+                return help();
+            };
+            let agent_kind = match kind {
+                "traex" => TranscriptKind::Traex,
+                "pi" => TranscriptKind::Pi,
+                _ => return help(),
+            };
+            let limit = match get("--limit").unwrap_or("64").parse::<u32>() {
+                Ok(n) if (1..=128).contains(&n) => n,
+                _ => return help(),
+            };
+            Method::AgentEventsRecoverTurn(AgentEventsRecoverTurnParams {
+                agent_kind,
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+                started_at: started_at.into(),
+                after: get("--after").map(str::to_owned),
+                limit,
+            })
+        }
+        "turns" => {
+            if values
+                .keys()
+                .any(|key| !["--kind", "--session-id", "--after", "--limit"].contains(key))
+            {
+                return help();
+            }
+            let (Some(kind), Some(session_id)) = (get("--kind"), get("--session-id")) else {
+                return help();
+            };
+            let agent_kind = match kind {
+                "traex" => TranscriptKind::Traex,
+                "pi" => TranscriptKind::Pi,
+                _ => return help(),
+            };
+            let limit = match get("--limit").unwrap_or("64").parse::<u32>() {
+                Ok(n) if (1..=128).contains(&n) => n,
+                _ => return help(),
+            };
+            Method::AgentEventsTurns(AgentEventsListTurnsParams {
+                agent_kind,
+                session_id: session_id.into(),
+                after: get("--after").map(str::to_owned),
+                limit,
+            })
+        }
         "attach" => {
             if values
                 .keys()
@@ -133,6 +212,6 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     }
 }
 fn help() -> std::io::Result<i32> {
-    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
+    eprintln!("herdr agent events sources\nherdr agent events capabilities\nherdr agent events submission --submission-id ID\nherdr agent events turns --kind traex|pi --session-id ID [--after CURSOR] [--limit 1..128]\nherdr agent events recover-turn --kind traex|pi --session-id ID --turn-id ID --started-at RFC3339 [--after CURSOR] [--limit 1..128]\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
     Ok(2)
 }

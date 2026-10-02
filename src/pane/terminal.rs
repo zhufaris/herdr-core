@@ -161,7 +161,7 @@ impl InputState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ProcessBytesResult {
     pub request_render: bool,
     pub render_delay: Option<Duration>,
@@ -170,6 +170,23 @@ pub(crate) struct ProcessBytesResult {
     pub clipboard_writes: Vec<Vec<u8>>,
     pub reported_cwd: Option<std::path::PathBuf>,
     pub terminal_responses: Vec<Bytes>,
+}
+
+impl ProcessBytesResult {
+    pub(crate) fn merge(&mut self, mut next: Self) {
+        self.request_render |= next.request_render;
+        self.render_delay = match (self.render_delay, next.render_delay) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (current, next) => current.or(next),
+        };
+        self.terminal_title_changed |= next.terminal_title_changed;
+        self.terminal_bells = self.terminal_bells.saturating_add(next.terminal_bells);
+        self.clipboard_writes.append(&mut next.clipboard_writes);
+        if next.reported_cwd.is_some() {
+            self.reported_cwd = next.reported_cwd;
+        }
+        self.terminal_responses.append(&mut next.terminal_responses);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -6084,6 +6101,32 @@ mod tests {
         let end = pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026l", &tx);
         assert!(end.request_render);
         assert_eq!(pane_terminal.synchronized_output_state(), (false, 2));
+    }
+
+    #[test]
+    fn merged_chunk_results_preserve_render_before_sync_reopens() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane_terminal = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
+
+        let mut batch = ProcessBytesResult::default();
+        batch.merge(pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026l\x1b[6n", &tx));
+        batch.merge(pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx));
+
+        assert!(
+            batch.request_render,
+            "the close chunk requested a render before synchronization reopened"
+        );
+        assert_eq!(batch.terminal_responses.len(), 1);
+        assert!(pane_terminal
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap());
     }
 
     #[test]

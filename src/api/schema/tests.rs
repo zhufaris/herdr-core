@@ -1573,3 +1573,57 @@ fn pane_link_resolve_round_trips() {
         result
     );
 }
+
+#[test]
+fn agent_events_recovery_requests_are_typed_and_bounded() {
+    let capabilities: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-capabilities",
+        "method": "agent.events.capabilities",
+        "params": {}
+    }))
+    .unwrap();
+    assert!(matches!(
+        capabilities.method,
+        Method::AgentEventsCapabilities(_)
+    ));
+
+    let submission: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-submission",
+        "method": "agent.events.submission",
+        "params": { "submission_id": "prompt-1" }
+    }))
+    .unwrap();
+    let Method::AgentEventsSubmission(submission) = submission.method else {
+        panic!("expected agent.events.submission");
+    };
+    assert_eq!(submission.submission_id, "prompt-1");
+
+    let turns: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-turns",
+        "method": "agent.events.turns",
+        "params": { "agent_kind": "traex", "session_id": "session-1", "limit": 16 }
+    }))
+    .unwrap();
+    let Method::AgentEventsTurns(turns) = turns.method else {
+        panic!("expected agent.events.turns");
+    };
+    assert_eq!(turns.limit, 16);
+    assert!(turns.after.is_none());
+
+    let recover: Request = serde_json::from_value(serde_json::json!({
+        "id": "events-recover",
+        "method": "agent.events.recover_turn",
+        "params": {
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "started_at": "2026-09-30T00:00:00Z"
+        }
+    }))
+    .unwrap();
+    let Method::AgentEventsRecoverTurn(recover) = recover.method else {
+        panic!("expected agent.events.recover_turn");
+    };
+    assert_eq!(recover.limit, 64);
+    assert!(recover.after.is_none());
+}

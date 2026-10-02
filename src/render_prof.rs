@@ -112,6 +112,19 @@ pub(crate) fn counter(name: &'static str, value: u64) {
     with_profiler(|profiler| profiler.increment(name, value));
 }
 
+pub(crate) fn counters(values: &[(&'static str, u64)]) {
+    if values.iter().all(|(_, value)| *value == 0) {
+        return;
+    }
+    with_profiler(|profiler| {
+        for (name, value) in values {
+            if *value != 0 {
+                profiler.increment(name, *value);
+            }
+        }
+    });
+}
+
 pub(crate) fn event(name: &'static str) {
     counter(name, 1);
 }

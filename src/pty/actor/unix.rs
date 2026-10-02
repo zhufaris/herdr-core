@@ -18,12 +18,81 @@ use crate::pty::fd;
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_READ_CHUNK_BYTES: usize = 8 * 1024;
+const PTY_READ_BATCH_BYTES: usize = 64 * 1024;
+const PTY_READ_BATCH_CHUNKS: usize = PTY_READ_BATCH_BYTES / PTY_READ_CHUNK_BYTES;
+const PTY_READ_DRAIN_BUDGET: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
     Running,
     Quiesced,
     Released,
+}
+
+#[derive(Debug)]
+enum ReadDrainStop {
+    WouldBlock,
+    ByteLimit,
+    TimeLimit,
+    Eof,
+    Error(std::io::Error),
+}
+
+#[derive(Debug)]
+struct ReadDrain {
+    bytes_read: usize,
+    chunks: usize,
+    read_syscalls: u64,
+    stop: ReadDrainStop,
+}
+
+fn drain_reader(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    chunk_ends: &mut [usize],
+    budget: Duration,
+) -> ReadDrain {
+    let started = Instant::now();
+    let mut bytes_read = 0;
+    let mut chunks = 0;
+    let mut read_syscalls = 0;
+
+    let stop = loop {
+        if bytes_read == buffer.len() || chunks == chunk_ends.len() {
+            break ReadDrainStop::ByteLimit;
+        }
+        if bytes_read > 0 && started.elapsed() >= budget {
+            break ReadDrainStop::TimeLimit;
+        }
+
+        let read_end = (bytes_read + PTY_READ_CHUNK_BYTES).min(buffer.len());
+        read_syscalls += 1;
+        match reader.read(&mut buffer[bytes_read..read_end]) {
+            Ok(0) => break ReadDrainStop::Eof,
+            Ok(n) => {
+                bytes_read += n;
+                chunk_ends[chunks] = bytes_read;
+                chunks += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                break ReadDrainStop::WouldBlock;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                if started.elapsed() >= budget {
+                    break ReadDrainStop::TimeLimit;
+                }
+            }
+            Err(err) => break ReadDrainStop::Error(err),
+        }
+    };
+
+    ReadDrain {
+        bytes_read,
+        chunks,
+        read_syscalls,
+        stop,
+    }
 }
 
 pub(crate) struct PtyReadResult {
@@ -39,7 +108,32 @@ impl PtyReadResult {
     }
 }
 
-type ReadCallback = Box<dyn FnMut(&[u8]) -> PtyReadResult + Send + 'static>;
+#[derive(Clone, Copy)]
+pub(crate) struct PtyReadBatch<'a> {
+    bytes: &'a [u8],
+    chunk_ends: &'a [usize],
+}
+
+impl<'a> PtyReadBatch<'a> {
+    fn new(bytes: &'a [u8], chunk_ends: &'a [usize]) -> Self {
+        Self { bytes, chunk_ends }
+    }
+
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub(crate) fn chunks(self) -> impl Iterator<Item = &'a [u8]> {
+        let mut start = 0;
+        self.chunk_ends.iter().map(move |end| {
+            let chunk = &self.bytes[start..*end];
+            start = *end;
+            chunk
+        })
+    }
+}
+
+type ReadCallback = Box<dyn FnMut(PtyReadBatch<'_>) -> PtyReadResult + Send + 'static>;
 type ReaderExitCallback = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +516,8 @@ impl PtyIoActor {
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
+            read_buffer: Box::new([0; PTY_READ_BATCH_BYTES]),
+            read_chunk_ends: [0; PTY_READ_BATCH_CHUNKS],
         };
         std::thread::Builder::new()
             .name(format!("herdr-pty-{}", config.pane_id))
@@ -456,6 +552,8 @@ struct PtyIoActorRunner {
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
+    read_buffer: Box<[u8; PTY_READ_BATCH_BYTES]>,
+    read_chunk_ends: [usize; PTY_READ_BATCH_CHUNKS],
 }
 
 struct ActiveSubmission {
@@ -548,7 +646,7 @@ impl PtyIoActorRunner {
                     }
                     if self.state == ActorState::Running
                         && readiness.pty_read_ready
-                        && !self.read_once()
+                        && !self.read_ready_batch()
                     {
                         break;
                     }
@@ -763,7 +861,7 @@ impl PtyIoActorRunner {
             if readiness.wake_ready {
                 fd::drain_wake_fd(self.wake_read_fd.as_raw_fd())?;
             }
-            if readiness.pty_read_ready && !self.read_once() {
+            if readiness.pty_read_ready && !self.read_ready_batch() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "PTY closed while draining writes before handoff",
@@ -813,39 +911,74 @@ impl PtyIoActorRunner {
         self.enqueue_terminal_responses(terminal_responses);
     }
 
-    fn read_once(&mut self) -> bool {
-        let mut buf = [0u8; 8192];
-        match self.file.read(&mut buf) {
-            Ok(0) => false,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
-            Err(err) => {
-                debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
-                false
-            }
-            Ok(n) => {
-                let response_order = Arc::clone(&self.response_order);
-                let _order = response_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
-                self.controls
+    fn read_ready_batch(&mut self) -> bool {
+        let drain = drain_reader(
+            &mut self.file,
+            self.read_buffer.as_mut_slice(),
+            &mut self.read_chunk_ends,
+            PTY_READ_DRAIN_BUDGET,
+        );
+        let reader_exited = matches!(&drain.stop, ReadDrainStop::Eof | ReadDrainStop::Error(_));
+        if let ReadDrainStop::Error(err) = &drain.stop {
+            debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
+        }
+
+        if drain.bytes_read > 0 {
+            let response_order = Arc::clone(&self.response_order);
+            let _order = response_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let batch = PtyReadBatch::new(
+                &self.read_buffer[..drain.bytes_read],
+                &self.read_chunk_ends[..drain.chunks],
+            );
+            let result = (self.on_read)(batch);
+            self.controls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .terminal_responses
+                .extend(result.terminal_responses);
+            drop(_order);
+            let terminal_responses = std::mem::take(
+                &mut self
+                    .controls
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminal_responses
-                    .extend(result.terminal_responses);
-                drop(_order);
-                let terminal_responses = std::mem::take(
-                    &mut self
-                        .controls
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .terminal_responses,
+                    .terminal_responses,
+            );
+            self.enqueue_terminal_responses(terminal_responses);
+        }
+
+        crate::render_prof::counters(&[
+            ("pty.read_syscalls", drain.read_syscalls),
+            ("pty.read_batches", u64::from(drain.bytes_read > 0)),
+            ("pty.read_batch_bytes", drain.bytes_read as u64),
+            (
+                "pty.read_batch_byte_limit",
+                u64::from(matches!(&drain.stop, ReadDrainStop::ByteLimit)),
+            ),
+            (
+                "pty.read_batch_time_limit",
+                u64::from(matches!(&drain.stop, ReadDrainStop::TimeLimit)),
+            ),
+        ]);
+
+        if reader_exited && !self.pending_writes.is_empty() {
+            match self.flush_pending_writes_once() {
+                Ok(Some(boundary)) => self.complete_submission_boundary(boundary),
+                Ok(None) => {}
+                Err(err) => self.fail_active_submission(err),
+            }
+            if !self.pending_writes.is_empty() {
+                warn!(
+                    pane = self.pane_id,
+                    pending_writes = self.pending_writes.len(),
+                    "dropping queued PTY writes after reader exit"
                 );
-                self.enqueue_terminal_responses(terminal_responses);
-                true
             }
         }
+
+        !reader_exited
     }
 
     fn enqueue_terminal_responses(&mut self, terminal_responses: Vec<Bytes>) {
@@ -1043,6 +1176,119 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
     };
 
+    enum ScriptedRead {
+        Data(Vec<u8>),
+        Error(std::io::ErrorKind),
+        Eof,
+    }
+
+    struct ScriptedReader {
+        reads: VecDeque<ScriptedRead>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(ScriptedRead::Eof) {
+                ScriptedRead::Data(mut bytes) => {
+                    let len = bytes.len().min(buffer.len());
+                    buffer[..len].copy_from_slice(&bytes[..len]);
+                    if len < bytes.len() {
+                        bytes.drain(..len);
+                        self.reads.push_front(ScriptedRead::Data(bytes));
+                    }
+                    Ok(len)
+                }
+                ScriptedRead::Error(kind) => Err(std::io::Error::from(kind)),
+                ScriptedRead::Eof => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn drain_reader_retries_interrupt_and_preserves_read_boundaries() {
+        let mut reader = ScriptedReader {
+            reads: VecDeque::from([
+                ScriptedRead::Error(std::io::ErrorKind::Interrupted),
+                ScriptedRead::Data(b"ab".to_vec()),
+                ScriptedRead::Data(b"cde".to_vec()),
+                ScriptedRead::Error(std::io::ErrorKind::WouldBlock),
+            ]),
+        };
+        let mut buffer = [0; 16];
+        let mut chunk_ends = [0; 4];
+
+        let drain = drain_reader(
+            &mut reader,
+            &mut buffer,
+            &mut chunk_ends,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(&buffer[..drain.bytes_read], b"abcde");
+        assert_eq!(&chunk_ends[..drain.chunks], &[2, 5]);
+        assert_eq!(drain.read_syscalls, 4);
+        assert!(matches!(drain.stop, ReadDrainStop::WouldBlock));
+    }
+
+    #[test]
+    fn drain_reader_returns_data_before_hard_error() {
+        let mut reader = ScriptedReader {
+            reads: VecDeque::from([
+                ScriptedRead::Data(b"final".to_vec()),
+                ScriptedRead::Error(std::io::ErrorKind::BrokenPipe),
+            ]),
+        };
+        let mut buffer = [0; 16];
+        let mut chunk_ends = [0; 4];
+
+        let drain = drain_reader(
+            &mut reader,
+            &mut buffer,
+            &mut chunk_ends,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(&buffer[..drain.bytes_read], b"final");
+        assert_eq!(&chunk_ends[..drain.chunks], &[5]);
+        assert!(matches!(
+            drain.stop,
+            ReadDrainStop::Error(ref error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    #[test]
+    fn drain_reader_never_overshoots_the_batch_buffer() {
+        let mut reader = ScriptedReader {
+            reads: VecDeque::from([ScriptedRead::Data(vec![b'x'; 32])]),
+        };
+        let mut buffer = [0; 10];
+        let mut chunk_ends = [0; 2];
+
+        let drain = drain_reader(
+            &mut reader,
+            &mut buffer,
+            &mut chunk_ends,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(drain.bytes_read, buffer.len());
+        assert_eq!(drain.chunks, 1);
+        assert!(matches!(drain.stop, ReadDrainStop::ByteLimit));
+        assert_eq!(buffer, [b'x'; 10]);
+    }
+
+    #[test]
+    fn pty_read_batch_exposes_original_chunks_and_contiguous_bytes() {
+        let batch = PtyReadBatch::new(b"abcde", &[2, 5]);
+
+        assert_eq!(batch.bytes(), b"abcde");
+        assert_eq!(
+            batch.chunks().collect::<Vec<_>>(),
+            vec![&b"ab"[..], &b"cde"[..]]
+        );
+    }
+
     fn test_wake_pair() -> (fd::WakeWriter, OwnedFd) {
         let pipe = fd::create_wake_pipe().expect("wake pipe");
         (pipe.writer, pipe.read_fd)
@@ -1070,9 +1316,9 @@ mod tests {
             pane_id: 1,
             master_fd: owned,
             initially_quiesced,
-            on_read: Box::new(move |bytes| {
+            on_read: Box::new(move |batch| {
                 read_tx
-                    .send(Bytes::copy_from_slice(bytes))
+                    .send(Bytes::copy_from_slice(batch.bytes()))
                     .expect("read callback receiver alive");
                 PtyReadResult::empty()
             }),
@@ -1112,6 +1358,8 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            read_buffer: Box::new([0; PTY_READ_BATCH_BYTES]),
+            read_chunk_ends: [0; PTY_READ_BATCH_CHUNKS],
         };
         (runner, peer)
     }
@@ -1415,9 +1663,9 @@ mod tests {
             pane_id: 1,
             master_fd: owned,
             initially_quiesced: false,
-            on_read: Box::new(move |bytes| {
+            on_read: Box::new(move |batch| {
                 read_tx
-                    .send(Bytes::copy_from_slice(bytes))
+                    .send(Bytes::copy_from_slice(batch.bytes()))
                     .expect("read callback receiver alive");
                 PtyReadResult::empty()
             }),
@@ -1565,6 +1813,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("actor reads held bytes after rollback");
         assert_eq!(read, Bytes::from_static(b"held"));
+        assert!(
+            read_rx.try_recv().is_err(),
+            "held bytes must be callbacked exactly once"
+        );
 
         handle
             .try_write_user_input(Bytes::from_static(b"after"))
@@ -1689,6 +1941,8 @@ mod tests {
             }),
             on_reader_exit: None,
             poll_observer: None,
+            read_buffer: Box::new([0; PTY_READ_BATCH_BYTES]),
+            read_chunk_ends: [0; PTY_READ_BATCH_CHUNKS],
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1713,7 +1967,7 @@ mod tests {
         peer.write_all(b"query").expect("write query");
         let reader = std::thread::spawn(move || {
             let mut runner = runner;
-            assert!(runner.read_once());
+            assert!(runner.read_ready_batch());
             runner
         });
         continue_tx.send(()).expect("release appearance report");
@@ -1816,6 +2070,8 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            read_buffer: Box::new([0; PTY_READ_BATCH_BYTES]),
+            read_chunk_ends: [0; PTY_READ_BATCH_CHUNKS],
         };
 
         runner.begin_handoff().expect("handoff drains queued write");

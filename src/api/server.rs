@@ -390,7 +390,11 @@ fn handle_connection_with_events(
         Method::AgentEventsAttach(_)
         | Method::AgentEventsSources(_)
         | Method::AgentEventsRead(_)
-        | Method::AgentEventsLocate(_) => {
+        | Method::AgentEventsLocate(_)
+        | Method::AgentEventsCapabilities(_)
+        | Method::AgentEventsSubmission(_)
+        | Method::AgentEventsRecoverTurn(_)
+        | Method::AgentEventsTurns(_) => {
             let source_id = match &request.method {
                 Method::AgentEventsRead(params) => Some(params.source_id.clone()),
                 Method::AgentEventsLocate(params) => Some(params.source_id.clone()),
@@ -405,7 +409,18 @@ fn handle_connection_with_events(
                     Method::AgentEventsLocate(params) => service
                         .locate(&params)
                         .map(|boundary| ResponseResult::AgentEventsTurnCursor { boundary }),
-                    _ => service.sources(),
+                    Method::AgentEventsCapabilities(_) => Ok(service.capabilities()),
+                    Method::AgentEventsSubmission(params) => service
+                        .submission(&params)
+                        .map(|receipt| ResponseResult::AgentEventsSubmissionReceipt { receipt }),
+                    Method::AgentEventsRecoverTurn(params) => service
+                        .recover_turn(&params)
+                        .map(|batch| ResponseResult::AgentEventsRecoveryBatch { batch }),
+                    Method::AgentEventsTurns(params) => service
+                        .turns(&params)
+                        .map(|turns| ResponseResult::AgentEventsTurnList { turns }),
+                    Method::AgentEventsSources(_) => service.sources(),
+                    _ => unreachable!("agent event stream method handled separately"),
                 },
                 None => Err(crate::agent_events::EventError("events_unavailable")),
             };
@@ -842,6 +857,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentEventsSources(_) => "agent.events.sources",
         Method::AgentEventsRead(_) => "agent.events.read",
         Method::AgentEventsLocate(_) => "agent.events.locate",
+        Method::AgentEventsCapabilities(_) => "agent.events.capabilities",
+        Method::AgentEventsSubmission(_) => "agent.events.submission",
+        Method::AgentEventsRecoverTurn(_) => "agent.events.recover_turn",
+        Method::AgentEventsTurns(_) => "agent.events.turns",
         Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",

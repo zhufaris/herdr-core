@@ -111,6 +111,25 @@ impl SourceReader {
         source: &RegisteredSource,
         checkpoint: &Checkpoint,
     ) -> Result<(Checkpoint, Vec<Decoded>)> {
+        Self::read_bounded(source, checkpoint, None)
+    }
+
+    pub(crate) fn read_until(
+        source: &RegisteredSource,
+        checkpoint: &Checkpoint,
+        end_offset: u64,
+    ) -> Result<(Checkpoint, Vec<Decoded>)> {
+        if end_offset < checkpoint.offset {
+            return Err(EventError("invalid_turn_boundary"));
+        }
+        Self::read_bounded(source, checkpoint, Some(end_offset))
+    }
+
+    fn read_bounded(
+        source: &RegisteredSource,
+        checkpoint: &Checkpoint,
+        end_offset: Option<u64>,
+    ) -> Result<(Checkpoint, Vec<Decoded>)> {
         let mut file = open_regular(&source.path)?;
         let header = match read_line(&mut file)? {
             ReadLine::Complete(line) => line,
@@ -131,10 +150,16 @@ impl SourceReader {
         let mut events = Vec::new();
         let mut budget = 0;
         if next.oversized_tail_scan > next.offset {
+            if end_offset.is_some_and(|end| next.oversized_tail_scan > end) {
+                return Err(EventError("turn_boundary_changed"));
+            }
             let start = next.offset;
             file.seek(SeekFrom::Start(next.oversized_tail_scan))?;
             match scan_to_newline(&mut file)? {
                 Some(end) => {
+                    if end_offset.is_some_and(|boundary| end > boundary) {
+                        return Err(EventError("turn_boundary_changed"));
+                    }
                     next.offset = end;
                     next.oversized_tail_scan = 0;
                     events.push(next.decoder.record_skipped(
@@ -151,6 +176,9 @@ impl SourceReader {
         }
         for _ in 0..MAX_BATCH {
             let start = next.offset;
+            if end_offset.is_some_and(|end| start >= end) {
+                break;
+            }
             match read_line(&mut file)? {
                 ReadLine::Incomplete => {
                     let end = file.metadata()?.len();
@@ -160,6 +188,9 @@ impl SourceReader {
                     break;
                 }
                 ReadLine::Complete(line) => {
+                    if end_offset.is_some_and(|end| start + line.len() as u64 > end) {
+                        return Err(EventError("turn_boundary_changed"));
+                    }
                     budget += line.len();
                     let value: Value = serde_json::from_slice(&line)?;
                     let mut candidate = next.decoder.clone();
@@ -179,6 +210,9 @@ impl SourceReader {
                     next.offset += line.len() as u64;
                 }
                 ReadLine::OversizedComplete { length } => {
+                    if end_offset.is_some_and(|end| start + length > end) {
+                        return Err(EventError("turn_boundary_changed"));
+                    }
                     budget += MAX_RECORD;
                     next.offset += length;
                     events.push(next.decoder.record_skipped(

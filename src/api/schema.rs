@@ -226,6 +226,14 @@ pub enum Method {
     AgentEventsRead(agent_events::AgentEventsReadParams),
     #[serde(rename = "agent.events.locate")]
     AgentEventsLocate(agent_events::AgentEventsLocateParams),
+    #[serde(rename = "agent.events.capabilities")]
+    AgentEventsCapabilities(EmptyParams),
+    #[serde(rename = "agent.events.submission")]
+    AgentEventsSubmission(agent_events::AgentEventsSubmissionParams),
+    #[serde(rename = "agent.events.recover_turn")]
+    AgentEventsRecoverTurn(agent_events::AgentEventsRecoverTurnParams),
+    #[serde(rename = "agent.events.turns")]
+    AgentEventsTurns(agent_events::AgentEventsListTurnsParams),
     #[serde(rename = "agent.events.subscribe")]
     AgentEventsSubscribe(agent_events::AgentEventsReadParams),
     #[serde(rename = "events.subscribe")]

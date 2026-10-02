@@ -63,6 +63,107 @@ pub struct AgentEventsTurnCursor {
     pub found: bool,
     pub after_cursor: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsSubmissionParams {
+    pub submission_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsSubmissionState {
+    Prepared,
+    Observed,
+    Terminal,
+    Cancelled,
+    LegacyUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsSubmissionReceipt {
+    pub submission_id: String,
+    pub state: AgentEventsSubmissionState,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsRecoverTurnParams {
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub turn_id: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default = "default_limit")]
+    #[schemars(range(min = 1, max = 128))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsRecoveryBatch {
+    pub outcome: AgentEventsRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_started_at: Option<String>,
+    pub events: Vec<AgentReplyEvent>,
+    pub next_cursor: String,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsRecoveryOutcome {
+    Recovered,
+    Indexing,
+    NotFound,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsCapabilities {
+    pub exact_turn_recovery_v1: bool,
+    pub historical_turn_index_recovery_v1: bool,
+    pub session_turn_enumeration_v1: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsListTurnsParams {
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default = "default_limit")]
+    #[schemars(range(min = 1, max = 128))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsTurnSummary {
+    pub turn_id: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+    pub has_human_message: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsTurnList {
+    pub turns: Vec<AgentEventsTurnSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
 fn default_limit() -> u32 {
     64
 }
@@ -78,6 +179,17 @@ pub struct AgentReplyEvent {
     pub turn_id: Option<String>,
     pub occurred_at: String,
     pub payload: ReplyPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    Completed,
+    BudgetLimited,
+    UsageLimited,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -111,6 +223,13 @@ pub enum ReplyPayload {
         call_id: String,
         text: String,
         is_error: bool,
+        truncated: bool,
+    },
+    GoalChanged {
+        goal_id: String,
+        objective: String,
+        status: GoalStatus,
+        source_updated_at: u64,
         truncated: bool,
     },
     BranchChanged {

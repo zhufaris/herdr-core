@@ -356,7 +356,7 @@ fn handle_connection_with_events(
         }
         Method::AgentPrompt(params) => {
             let submission_id = params.submission_id.clone();
-            if submission_id.is_some() {
+            if let Some(submission_id) = submission_id.as_deref() {
                 let prepared = match reply_streams {
                     Some(service) => service.prepare_submission(&params, api_tx),
                     None => Err(crate::agent_events::EventError("events_unavailable")),
@@ -369,7 +369,7 @@ fn handle_connection_with_events(
                             .and_then(|service| {
                                 service.submission(
                                     &crate::api::schema::agent_events::AgentEventsSubmissionParams {
-                                        submission_id: submission_id.clone().unwrap(),
+                                        submission_id: submission_id.to_owned(),
                                     },
                                 )
                             });

@@ -788,6 +788,44 @@ fn success_response_round_trips() {
 }
 
 #[test]
+fn frozen_session_event_stream_fixture_matches_public_response_types() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/herdr-session-events-v1.json"
+    ))
+    .unwrap();
+
+    let capability: ResponseResult = serde_json::from_value(fixture["capability"].clone()).unwrap();
+    let ResponseResult::Pong {
+        version,
+        protocol,
+        capabilities: Some(capabilities),
+    } = capability
+    else {
+        panic!("fixture capability is not a pong response");
+    };
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(protocol, crate::protocol::PROTOCOL_VERSION);
+    assert!(capabilities.session_event_stream_v1);
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["opened"].clone()).unwrap(),
+        ResponseResult::SessionEventsOpened { .. }
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["batch"].clone()).unwrap(),
+        ResponseResult::SessionEventsBatch { .. }
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["receipt"].clone()).unwrap(),
+        ResponseResult::AgentEventsSubmissionReceipt { .. }
+    ));
+
+    let cursor_expired = &fixture["cursorExpired"];
+    assert_eq!(cursor_expired["code"], "cursor_expired");
+    assert_eq!(cursor_expired["earliest_cursor"], "cursor-4");
+    assert_eq!(cursor_expired["latest_cursor"], "cursor-10");
+}
+
+#[test]
 fn session_snapshot_request_and_response_round_trip() {
     let request = Request {
         id: "req_snapshot".into(),

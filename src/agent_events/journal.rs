@@ -116,12 +116,18 @@ impl Journal {
             .optional()?;
         let definition = serde_json::to_string(source)?;
         if let Some((existing_definition, existing_checkpoint)) = existing {
-            if definition != existing_definition {
+            let existing_source: RegisteredSource = serde_json::from_str(&existing_definition)?;
+            if existing_source.terminal_id != source.terminal_id
+                || existing_source.kind != source.kind
+                || existing_source.session_id != source.session_id
+                || existing_source.header_hash != source.header_hash
+                || existing_source.file_identity != source.file_identity
+            {
                 return Err(EventError("source_identity_conflict"));
             }
             self.db.execute(
-                "UPDATE sources SET state='active',error=NULL WHERE id=?",
-                [&source.id],
+                "UPDATE sources SET definition=?,state='active',error=NULL WHERE id=?",
+                params![definition, source.id],
             )?;
             return Ok(serde_json::from_str(&existing_checkpoint)?);
         }
@@ -796,6 +802,41 @@ mod tests {
             "active"
         );
         drop(j);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reattaching_the_same_session_epoch_refreshes_ephemeral_source_details() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-session-epoch-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let source = RegisteredSource {
+            id: "epoch-1".into(),
+            terminal_id: "term".into(),
+            kind: TranscriptKind::Traex,
+            session_id: "session".into(),
+            path: "/session.jsonl".into(),
+            foreground_pid: 10,
+            header_hash: "header".into(),
+            file_identity: "file".into(),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        journal.attach(&source, &Checkpoint::default()).unwrap();
+
+        let mut after_restart = source.clone();
+        after_restart.foreground_pid = 20;
+        journal
+            .attach(&after_restart, &Checkpoint::default())
+            .unwrap();
+
+        let active = journal.active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0.foreground_pid, 20);
+
+        drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

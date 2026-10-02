@@ -12,7 +12,7 @@ use std::path::Path;
 const MAX_SOURCES: i64 = 256;
 const RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 const MAX_EVENT_BYTES: i64 = 192 * 1024 * 1024;
-const JOURNAL_VERSION: i64 = 2;
+const JOURNAL_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionPrepareResult {
@@ -66,7 +66,7 @@ impl Journal {
         if version == 0 {
             db.execute_batch("PRAGMA user_version=1;")?;
         }
-        if version < JOURNAL_VERSION {
+        if version <= 1 {
             db.execute_batch(
                 "BEGIN IMMEDIATE;
                 DROP INDEX IF EXISTS pending_submissions_match;
@@ -93,9 +93,62 @@ impl Journal {
                 DROP TABLE pending_submissions_v1;
                 CREATE INDEX pending_submissions_match
                     ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,correlated,created);
-                PRAGMA user_version=2;
+                PRAGMA user_version=3;
                 COMMIT;",
             )?;
+        } else if version == 2 {
+            let pending_submission_columns = {
+                let mut statement = db.prepare("PRAGMA table_info(pending_submissions)")?;
+                let columns = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                columns
+            };
+            let has_column = |name: &str| {
+                pending_submission_columns
+                    .iter()
+                    .any(|column| column == name)
+            };
+            if has_column("transcript_id") && !has_column("correlated") {
+                db.execute_batch(
+                    "BEGIN IMMEDIATE;
+                    DROP INDEX IF EXISTS pending_submissions_match;
+                    ALTER TABLE pending_submissions RENAME TO pending_submissions_rich_v2;
+                    CREATE TABLE pending_submissions (
+                        submission_id TEXT PRIMARY KEY,
+                        terminal_id TEXT NOT NULL,
+                        agent_kind TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        text_digest TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                        correlated INTEGER NOT NULL DEFAULT 0 CHECK(correlated IN (0,1)),
+                        created INTEGER NOT NULL,
+                        updated INTEGER NOT NULL
+                    );
+                    INSERT INTO pending_submissions(
+                        submission_id,terminal_id,agent_kind,session_id,text_digest,state,correlated,created,updated
+                    )
+                    SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
+                        CASE state
+                            WHEN 'observed' THEN 'accepted'
+                            WHEN 'terminal' THEN 'accepted'
+                            WHEN 'cancelled' THEN 'rejected'
+                            ELSE 'uncertain'
+                        END,
+                        CASE WHEN human_event_key IS NOT NULL THEN 1 ELSE 0 END,
+                        created,updated
+                    FROM pending_submissions_rich_v2;
+                    DROP TABLE pending_submissions_rich_v2;
+                    CREATE INDEX pending_submissions_match
+                        ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,correlated,created);
+                    PRAGMA user_version=3;
+                    COMMIT;",
+                )?;
+            } else if has_column("correlated") && !has_column("transcript_id") {
+                db.execute_batch("PRAGMA user_version=3;")?;
+            } else {
+                return Err(EventError("unsupported_journal_schema"));
+            }
         }
         let id: String = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
             r.get(0)
@@ -1509,6 +1562,102 @@ mod tests {
             AgentEventsSubmissionState::Rejected
         );
         drop(reopened_again);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deployed_rich_v2_receipts_migrate_without_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-rich-v2-migration-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending_submissions (
+                submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
+                session_id TEXT NOT NULL, text_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('prepared','observed','terminal','cancelled','legacy_unavailable')),
+                transcript_id TEXT, turn_id TEXT, turn_started_at TEXT, human_event_key TEXT,
+                terminal_state TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL);
+             INSERT INTO pending_submissions VALUES
+                ('prepared','term','traex','session','digest','prepared',NULL,NULL,NULL,NULL,NULL,1,2),
+                ('observed','term','traex','session','digest','observed','transcript','turn','started','human',NULL,3,4),
+                ('terminal','term','traex','session','digest','terminal','transcript','turn','started','human','completed',5,6),
+                ('cancelled','term','traex','session','digest','cancelled',NULL,NULL,NULL,NULL,NULL,7,8),
+                ('unavailable','term','traex','session','digest','legacy_unavailable',NULL,NULL,NULL,NULL,NULL,9,10);
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        drop(db);
+
+        let journal = Journal::open(&path).unwrap();
+        for (submission_id, expected) in [
+            ("prepared", AgentEventsSubmissionState::Uncertain),
+            ("observed", AgentEventsSubmissionState::Accepted),
+            ("terminal", AgentEventsSubmissionState::Accepted),
+            ("cancelled", AgentEventsSubmissionState::Rejected),
+            ("unavailable", AgentEventsSubmissionState::Uncertain),
+        ] {
+            let receipt = journal.submission_receipt(submission_id).unwrap();
+            assert_eq!(receipt.state, expected);
+        }
+        let version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened.submission_receipt("terminal").unwrap().state,
+            AgentEventsSubmissionState::Accepted
+        );
+        drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unified_v2_terminal_receipts_upgrade_without_state_loss() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-unified-v2-migration-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending_submissions (
+                submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
+                session_id TEXT NOT NULL, text_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                correlated INTEGER NOT NULL DEFAULT 0 CHECK(correlated IN (0,1)),
+                created INTEGER NOT NULL, updated INTEGER NOT NULL);
+             INSERT INTO pending_submissions VALUES
+                ('accepted','term','traex','session','a','accepted',1,1,2),
+                ('rejected','term','traex','session','b','rejected',0,3,4);
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        drop(db);
+
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal.submission_receipt("accepted").unwrap().state,
+            AgentEventsSubmissionState::Accepted
+        );
+        assert_eq!(
+            journal.submission_receipt("rejected").unwrap().state,
+            AgentEventsSubmissionState::Rejected
+        );
+        let version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

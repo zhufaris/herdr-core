@@ -1547,3 +1547,42 @@ fn agent_events_locate_requires_an_explicit_boundary() {
     assert_eq!(params.boundary, agent_events::AgentEventsTurnBoundary::At);
     assert_eq!(params.turn_id.as_deref(), Some("turn-1"));
 }
+
+#[test]
+fn agent_events_submission_receipt_has_a_stable_public_shape() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "submission-receipt",
+        "method": "agent.events.submission",
+        "params": { "submission_id": "prompt-1" }
+    }))
+    .unwrap();
+    let Method::AgentEventsSubmission(params) = request.method else {
+        panic!("expected agent.events.submission");
+    };
+    assert_eq!(params.submission_id, "prompt-1");
+
+    let result = ResponseResult::AgentEventsSubmissionReceipt {
+        receipt: agent_events::AgentEventsSubmissionReceipt {
+            submission_id: "prompt-1".into(),
+            terminal_id: "terminal-1".into(),
+            agent_kind: agent_events::TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            state: agent_events::AgentEventsSubmissionState::Accepted,
+            created_at: 10,
+            updated_at: 11,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({
+            "type": "agent_events_submission_receipt",
+            "submission_id": "prompt-1",
+            "terminal_id": "terminal-1",
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "state": "accepted",
+            "created_at": 10,
+            "updated_at": 11
+        })
+    );
+}

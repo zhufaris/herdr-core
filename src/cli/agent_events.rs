@@ -1,6 +1,6 @@
 use crate::api::schema::agent_events::{
     AgentEventsAttachFrom, AgentEventsAttachParams, AgentEventsLocateParams, AgentEventsReadParams,
-    AgentEventsTurnBoundary, TranscriptKind,
+    AgentEventsSubmissionParams, AgentEventsTurnBoundary, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -103,6 +103,17 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
                 started_at: get("--started-at").map(str::to_owned),
             })
         }
+        "submission" => {
+            if values.keys().any(|k| !["--submission-id"].contains(k)) {
+                return help();
+            }
+            let Some(submission_id) = get("--submission-id") else {
+                return help();
+            };
+            Method::AgentEventsSubmission(AgentEventsSubmissionParams {
+                submission_id: submission_id.into(),
+            })
+        }
         _ => return help(),
     };
     let request = Request {
@@ -133,6 +144,6 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     }
 }
 fn help() -> std::io::Result<i32> {
-    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
+    eprintln!("herdr agent events sources\nherdr agent events attach --pane ID --kind traex|pi --session-id ID --path PATH [--from start|end]\nherdr agent events locate --source ID --boundary active|at|after [--turn-id ID --started-at RFC3339]\nherdr agent events submission --submission-id ID\nherdr agent events read|subscribe --source ID [--after start|latest|CURSOR] [--limit 1..128]");
     Ok(2)
 }

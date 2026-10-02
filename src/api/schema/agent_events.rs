@@ -7,6 +7,32 @@ pub enum TranscriptKind {
     Pi,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsSubmissionState {
+    Prepared,
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentEventsSubmissionReceipt {
+    pub submission_id: String,
+    pub terminal_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub state: AgentEventsSubmissionState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEventsSubmissionParams {
+    pub submission_id: String,
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]

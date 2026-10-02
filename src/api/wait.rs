@@ -175,6 +175,27 @@ pub(super) fn wait_for_agent(
     }
 }
 
+pub(super) struct PromptAgentResponse {
+    pub response: Option<String>,
+    pub submission_response: Option<String>,
+}
+
+impl PromptAgentResponse {
+    fn before_submission(response: String) -> Self {
+        Self {
+            response: Some(response.clone()),
+            submission_response: Some(response),
+        }
+    }
+
+    fn after_submission(response: Option<String>, submission_response: String) -> Self {
+        Self {
+            response,
+            submission_response: Some(submission_response),
+        }
+    }
+}
+
 pub(super) fn prompt_agent(
     request_id: String,
     mut params: crate::api::schema::AgentPromptParams,
@@ -182,17 +203,18 @@ pub(super) fn prompt_agent(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<PromptAgentResponse> {
     let submission_id = params.submission_id.clone();
     let Some(wait) = params.wait.clone() else {
-        return Ok(Some(dispatch_to_app_with_timeout(
+        let response = dispatch_to_app_with_timeout(
             Request {
                 id: request_id,
                 method: Method::AgentPrompt(params),
             },
             api_tx,
             None,
-        )));
+        );
+        return Ok(PromptAgentResponse::before_submission(response));
     };
 
     let wait_started = std::time::Instant::now();
@@ -206,7 +228,7 @@ pub(super) fn prompt_agent(
         Ok(agent) => agent,
         Err(response) => {
             return serde_json::to_string(&response)
-                .map(Some)
+                .map(PromptAgentResponse::before_submission)
                 .map_err(std::io::Error::other);
         }
     };
@@ -232,7 +254,7 @@ pub(super) fn prompt_agent(
     #[cfg(not(windows))]
     let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
-        return Ok(Some(prompt_response));
+        return Ok(PromptAgentResponse::before_submission(prompt_response));
     };
     if !agent_wait_identity_matches(
         &prompted,
@@ -240,7 +262,9 @@ pub(super) fn prompt_agent(
         before_prompt.name.as_deref().filter(|name| *name == target),
         before_prompt.agent.as_deref(),
     ) {
-        return agent_wait_not_running(request_id).map(Some);
+        return agent_wait_not_running(request_id).map(|response| {
+            PromptAgentResponse::after_submission(Some(response), prompt_response)
+        });
     }
 
     let prompt_activity_observed = prompt_started_working
@@ -283,15 +307,22 @@ pub(super) fn prompt_agent(
             running,
         )?
         else {
-            return Ok(None);
+            return Ok(PromptAgentResponse::after_submission(None, prompt_response));
         };
         initial = match outcome {
             AgentWaitOutcome::Matched(agent) => *agent,
-            AgentWaitOutcome::Response(response) => return Ok(Some(response)),
+            AgentWaitOutcome::Response(response) => {
+                return Ok(PromptAgentResponse::after_submission(
+                    Some(response),
+                    prompt_response,
+                ));
+            }
         };
     }
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial, submission_id).map(Some);
+        return agent_prompt_success(request_id, initial, submission_id).map(|response| {
+            PromptAgentResponse::after_submission(Some(response), prompt_response)
+        });
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -314,13 +345,19 @@ pub(super) fn prompt_agent(
         running,
     )?
     else {
-        return Ok(None);
+        return Ok(PromptAgentResponse::after_submission(None, prompt_response));
     };
     let agent = match outcome {
         AgentWaitOutcome::Matched(agent) => *agent,
-        AgentWaitOutcome::Response(response) => return Ok(Some(response)),
+        AgentWaitOutcome::Response(response) => {
+            return Ok(PromptAgentResponse::after_submission(
+                Some(response),
+                prompt_response,
+            ));
+        }
     };
-    agent_prompt_success(request_id, agent, submission_id).map(Some)
+    agent_prompt_success(request_id, agent, submission_id)
+        .map(|response| PromptAgentResponse::after_submission(Some(response), prompt_response))
 }
 
 pub(super) fn prompt_agent_after_model_resume(
@@ -331,15 +368,21 @@ pub(super) fn prompt_agent_after_model_resume(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<PromptAgentResponse> {
     let deadline = std::time::Instant::now() + AGENT_MODEL_RESUME_TIMEOUT;
     loop {
         if should_stop_connection(stream, running)? {
-            return Ok(None);
+            return Ok(PromptAgentResponse {
+                response: None,
+                submission_response: None,
+            });
         }
         let current = match agent_get(&request_id, &params.target, api_tx) {
             Ok(agent) => agent,
-            Err(response) => return agent_wait_probe_error(response).map(Some),
+            Err(response) => {
+                return agent_wait_probe_error(response)
+                    .map(PromptAgentResponse::before_submission);
+            }
         };
         if current.terminal_id != expected_terminal_id
             || current
@@ -347,7 +390,7 @@ pub(super) fn prompt_agent_after_model_resume(
                 .as_ref()
                 .is_some_and(|session| session.value != params.expected_session_id)
         {
-            return agent_wait_not_running(request_id).map(Some);
+            return agent_wait_not_running(request_id).map(PromptAgentResponse::before_submission);
         }
         if model_resume_ready(&current, &expected_terminal_id, &params.expected_session_id) {
             return prompt_agent(
@@ -373,7 +416,7 @@ pub(super) fn prompt_agent_after_model_resume(
                     message: "timed out waiting for the model-selected TraeX session".into(),
                 },
             })
-            .map(Some)
+            .map(PromptAgentResponse::before_submission)
             .map_err(std::io::Error::other);
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
@@ -413,6 +456,7 @@ fn agent_prompt_success(
         result: ResponseResult::AgentPrompted {
             agent,
             submission_id,
+            submission_receipt: None,
         },
     })
     .map_err(std::io::Error::other)

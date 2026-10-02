@@ -6,6 +6,7 @@ use crate::agent_events::{
 };
 use crate::api::schema::agent_events::{
     AgentEventsAttachParams, AgentEventsBatch, AgentEventsLocateParams, AgentEventsReadParams,
+    AgentEventsSubmissionParams, AgentEventsSubmissionReceipt, AgentEventsSubmissionState,
     AgentEventsTurnCursor, TranscriptKind,
 };
 use crate::api::schema::{EmptyParams, Method, PaneProcessInfoParams, Request, ResponseResult};
@@ -204,12 +205,26 @@ impl ReplyStreams {
         })
     }
 
-    pub fn cancel_prepared_submission(
+    pub fn submission(
+        &self,
+        params: &AgentEventsSubmissionParams,
+    ) -> crate::agent_events::Result<AgentEventsSubmissionReceipt> {
+        self.with_journal(false, |journal| {
+            journal.submission_receipt(&params.submission_id)
+        })
+    }
+    pub fn settle_submission(
         &self,
         submission_id: &str,
-    ) -> crate::agent_events::Result<()> {
-        self.with_journal(false, |journal| {
-            journal.cancel_prepared_submission(submission_id)
+        state: AgentEventsSubmissionState,
+    ) -> crate::agent_events::Result<AgentEventsSubmissionReceipt> {
+        self.with_journal(false, |journal| match state {
+            AgentEventsSubmissionState::Prepared => journal.submission_receipt(submission_id),
+            AgentEventsSubmissionState::Accepted => journal.mark_submission_accepted(submission_id),
+            AgentEventsSubmissionState::Rejected => journal.mark_submission_rejected(submission_id),
+            AgentEventsSubmissionState::Uncertain => {
+                journal.mark_submission_uncertain(submission_id)
+            }
         })
     }
     pub fn read(

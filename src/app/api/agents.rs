@@ -93,6 +93,7 @@ impl App {
                                     ResponseResult::AgentPrompted {
                                         agent,
                                         submission_id,
+                                        submission_receipt: None,
                                     },
                                 ),
                                 Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
@@ -278,11 +279,19 @@ impl App {
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(focus) => focus,
                 Err(err) => {
-                    return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
+                    return Err(encode_error(
+                        id,
+                        "agent_prompt_not_submitted",
+                        err.to_string(),
+                    ));
                 }
             };
             if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
-                return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
+                return Err(encode_error(
+                    id,
+                    "agent_prompt_not_submitted",
+                    err.to_string(),
+                ));
             }
         }
         let (text, enter) =
@@ -311,7 +320,9 @@ impl App {
                 submit_delay,
                 submit_deadline,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+            .map_err(|err| {
+                encode_error(id.clone(), "agent_prompt_not_submitted", err.to_string())
+            })?;
         Ok((id, agent, params.submission_id, completion))
     }
 
@@ -659,11 +670,13 @@ mod tests {
         let ResponseResult::AgentPrompted {
             agent,
             submission_id,
+            submission_receipt,
         } = success.result
         else {
             panic!("expected prompted response");
         };
         assert_eq!(submission_id.as_deref(), Some("prompt-1"));
+        assert!(submission_receipt.is_none());
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
         assert_eq!(
             rx.try_recv().unwrap(),

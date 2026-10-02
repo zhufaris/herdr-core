@@ -2,8 +2,9 @@ use super::codec::Decoded;
 use super::source::Checkpoint;
 use super::{digest, now, EventError, RegisteredSource, Result};
 use crate::api::schema::agent_events::{
-    AgentEventSource, AgentEventsBatch, AgentEventsLocateParams, AgentEventsTurnBoundary,
-    AgentEventsTurnCursor, AgentReplyEvent, ReplyPayload,
+    AgentEventSource, AgentEventsBatch, AgentEventsLocateParams, AgentEventsSubmissionReceipt,
+    AgentEventsSubmissionState, AgentEventsTurnBoundary, AgentEventsTurnCursor, AgentReplyEvent,
+    ReplyPayload, TranscriptKind,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -11,6 +12,7 @@ use std::path::Path;
 const MAX_SOURCES: i64 = 256;
 const RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 const MAX_EVENT_BYTES: i64 = 192 * 1024 * 1024;
+const JOURNAL_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionPrepareResult {
@@ -42,7 +44,7 @@ impl Journal {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > JOURNAL_VERSION {
             return Err(EventError("unsupported_journal_version"));
         }
         db.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;
@@ -54,6 +56,42 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS pending_submissions (submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL, text_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','consumed')), created INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
             PRAGMA user_version=1;")?;
+        if version < JOURNAL_VERSION {
+            db.execute_batch(
+                "BEGIN IMMEDIATE;
+                DROP INDEX IF EXISTS pending_submissions_match;
+                ALTER TABLE pending_submissions RENAME TO pending_submissions_v1;
+                CREATE TABLE pending_submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    terminal_id TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    text_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                    correlated INTEGER NOT NULL DEFAULT 0 CHECK(correlated IN (0,1)),
+                    created INTEGER NOT NULL,
+                    updated INTEGER NOT NULL
+                );
+                INSERT INTO pending_submissions(
+                    submission_id,terminal_id,agent_kind,session_id,text_digest,state,correlated,created,updated
+                )
+                SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
+                    CASE state WHEN 'consumed' THEN 'accepted' ELSE 'prepared' END,
+                    CASE state WHEN 'consumed' THEN 1 ELSE 0 END,
+                    created,created
+                FROM pending_submissions_v1;
+                DROP TABLE pending_submissions_v1;
+                CREATE INDEX pending_submissions_match
+                    ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,correlated,created);
+                PRAGMA user_version=2;
+                COMMIT;",
+            )?;
+        }
+        db.execute(
+            "UPDATE pending_submissions SET state='uncertain',updated=?
+             WHERE state='prepared'",
+            [now()],
+        )?;
         let id = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
             r.get(0)
         })?;
@@ -112,8 +150,8 @@ impl Journal {
             return Err(EventError("invalid_submission_id"));
         }
         let kind = match agent_kind {
-            crate::api::schema::agent_events::TranscriptKind::Traex => "traex",
-            crate::api::schema::agent_events::TranscriptKind::Pi => "pi",
+            TranscriptKind::Traex => "traex",
+            TranscriptKind::Pi => "pi",
         };
         let text_digest = super::codec::human_message_digest(text);
         let existing: Option<(String, String, String, String)> = self
@@ -137,20 +175,105 @@ impl Journal {
             }
             return Err(EventError("submission_identity_conflict"));
         }
+        let timestamp = now();
         self.db.execute(
-            "INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created) VALUES (?,?,?,?,?,'prepared',?)",
-            params![submission_id, terminal_id, kind, session_id, text_digest, now()],
+            "INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created,updated) VALUES (?,?,?,?,?,'prepared',?,?)",
+            params![submission_id, terminal_id, kind, session_id, text_digest, timestamp, timestamp],
         )?;
         Ok(SubmissionPrepareResult::Prepared)
     }
 
-    pub(crate) fn cancel_prepared_submission(&mut self, submission_id: &str) -> Result<()> {
-        self.db.execute(
-            "DELETE FROM pending_submissions WHERE submission_id=? AND state='prepared'",
-            [submission_id],
-        )?;
-        Ok(())
+    pub(crate) fn submission_receipt(
+        &self,
+        submission_id: &str,
+    ) -> Result<AgentEventsSubmissionReceipt> {
+        if submission_id.is_empty() || submission_id.len() > 256 {
+            return Err(EventError("invalid_submission_id"));
+        }
+        self.db
+            .query_row(
+                "SELECT terminal_id,agent_kind,session_id,state,created,updated
+                 FROM pending_submissions WHERE submission_id=?",
+                [submission_id],
+                |row| {
+                    let kind: String = row.get(1)?;
+                    let state: String = row.get(3)?;
+                    Ok(AgentEventsSubmissionReceipt {
+                        submission_id: submission_id.to_owned(),
+                        terminal_id: row.get(0)?,
+                        agent_kind: match kind.as_str() {
+                            "traex" => TranscriptKind::Traex,
+                            "pi" => TranscriptKind::Pi,
+                            _ => return Err(rusqlite::Error::InvalidQuery),
+                        },
+                        session_id: row.get(2)?,
+                        state: match state.as_str() {
+                            "prepared" => AgentEventsSubmissionState::Prepared,
+                            "accepted" => AgentEventsSubmissionState::Accepted,
+                            "rejected" => AgentEventsSubmissionState::Rejected,
+                            "uncertain" => AgentEventsSubmissionState::Uncertain,
+                            _ => return Err(rusqlite::Error::InvalidQuery),
+                        },
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(EventError("submission_not_found"))
     }
+
+    pub(crate) fn mark_submission_accepted(
+        &mut self,
+        submission_id: &str,
+    ) -> Result<AgentEventsSubmissionReceipt> {
+        self.transition_prepared_submission(
+            submission_id,
+            "accepted",
+            AgentEventsSubmissionState::Accepted,
+        )
+    }
+
+    pub(crate) fn mark_submission_rejected(
+        &mut self,
+        submission_id: &str,
+    ) -> Result<AgentEventsSubmissionReceipt> {
+        self.transition_prepared_submission(
+            submission_id,
+            "rejected",
+            AgentEventsSubmissionState::Rejected,
+        )
+    }
+
+    pub(crate) fn mark_submission_uncertain(
+        &mut self,
+        submission_id: &str,
+    ) -> Result<AgentEventsSubmissionReceipt> {
+        self.transition_prepared_submission(
+            submission_id,
+            "uncertain",
+            AgentEventsSubmissionState::Uncertain,
+        )
+    }
+
+    fn transition_prepared_submission(
+        &mut self,
+        submission_id: &str,
+        stored_state: &str,
+        expected_state: AgentEventsSubmissionState,
+    ) -> Result<AgentEventsSubmissionReceipt> {
+        self.db.execute(
+            "UPDATE pending_submissions SET state=?,updated=?
+             WHERE submission_id=? AND state='prepared'",
+            params![stored_state, now(), submission_id],
+        )?;
+        let receipt = self.submission_receipt(submission_id)?;
+        if receipt.state != expected_state {
+            return Err(EventError("submission_state_conflict"));
+        }
+        Ok(receipt)
+    }
+
     pub(crate) fn pending(&self, verify_all: bool) -> Result<Vec<(RegisteredSource, Checkpoint)>> {
         let mut stmt = self.db.prepare("SELECT definition,json_extract(checkpoint,'$.offset') FROM sources WHERE state='active'")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -213,21 +336,21 @@ impl Journal {
             {
                 if submission_id.is_none() {
                     let kind = match source.kind {
-                        crate::api::schema::agent_events::TranscriptKind::Traex => "traex",
-                        crate::api::schema::agent_events::TranscriptKind::Pi => "pi",
+                        TranscriptKind::Traex => "traex",
+                        TranscriptKind::Pi => "pi",
                     };
                     let text_digest = super::codec::human_message_digest(text);
                     let matched: Option<String> = tx
                         .query_row(
-                            "SELECT submission_id FROM pending_submissions WHERE terminal_id=? AND agent_kind=? AND session_id=? AND text_digest=? AND state='prepared' ORDER BY created,rowid LIMIT 1",
+                            "SELECT submission_id FROM pending_submissions WHERE terminal_id=? AND agent_kind=? AND session_id=? AND text_digest=? AND state IN ('prepared','accepted','uncertain') AND correlated=0 ORDER BY created,rowid LIMIT 1",
                             params![source.terminal_id, kind, source.session_id, text_digest],
                             |row| row.get(0),
                         )
                         .optional()?;
                     if let Some(matched) = matched {
                         tx.execute(
-                            "UPDATE pending_submissions SET state='consumed' WHERE submission_id=? AND state='prepared'",
-                            [&matched],
+                            "UPDATE pending_submissions SET correlated=1,updated=? WHERE submission_id=? AND correlated=0",
+                            params![now(), &matched],
                         )?;
                         *submission_id = Some(matched);
                     }
@@ -540,7 +663,7 @@ fn timestamps_equal(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::agent_events::TranscriptKind;
+    use crate::api::schema::agent_events::{AgentEventsSubmissionState, TranscriptKind};
 
     #[test]
     fn timestamp_comparison_tolerates_only_subsecond_precision_loss() {
@@ -720,6 +843,7 @@ mod tests {
                 .unwrap(),
             SubmissionPrepareResult::Duplicate
         );
+        journal.mark_submission_accepted("prompt-1").unwrap();
         let mut next = before.clone();
         next.offset = 10;
         journal
@@ -761,6 +885,176 @@ mod tests {
             SubmissionPrepareResult::Duplicate
         );
         drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accepted_submission_receipt_survives_reopen_without_transcript_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-submission-receipt-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal
+                .prepare_submission(
+                    "prompt-receipt",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "continue"
+                )
+                .unwrap(),
+            SubmissionPrepareResult::Prepared
+        );
+        assert_eq!(
+            journal.submission_receipt("prompt-receipt").unwrap().state,
+            AgentEventsSubmissionState::Prepared
+        );
+
+        let accepted = journal.mark_submission_accepted("prompt-receipt").unwrap();
+        assert_eq!(accepted.state, AgentEventsSubmissionState::Accepted);
+        drop(journal);
+
+        let mut reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened.submission_receipt("prompt-receipt").unwrap().state,
+            AgentEventsSubmissionState::Accepted
+        );
+        assert_eq!(
+            reopened
+                .prepare_submission(
+                    "prompt-receipt",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "continue"
+                )
+                .unwrap(),
+            SubmissionPrepareResult::Duplicate
+        );
+        drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prepared_submission_becomes_uncertain_when_the_journal_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-submission-uncertain-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .prepare_submission(
+                "prompt-uncertain",
+                "term",
+                TranscriptKind::Traex,
+                "session",
+                "continue",
+            )
+            .unwrap();
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .submission_receipt("prompt-uncertain")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Uncertain
+        );
+        drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn submission_receipts_record_rejected_and_uncertain_terminal_outcomes() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-submission-outcomes-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        for submission_id in ["prompt-rejected", "prompt-uncertain"] {
+            journal
+                .prepare_submission(
+                    submission_id,
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    submission_id,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            journal
+                .mark_submission_rejected("prompt-rejected")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Rejected
+        );
+        assert_eq!(
+            journal
+                .mark_submission_uncertain("prompt-uncertain")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Uncertain
+        );
+        assert_eq!(
+            journal
+                .mark_submission_accepted("prompt-rejected")
+                .unwrap_err()
+                .0,
+            "submission_state_conflict"
+        );
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn version_one_submission_rows_migrate_without_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-submission-migration-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending_submissions (
+                submission_id TEXT PRIMARY KEY,
+                terminal_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                text_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('prepared','consumed')),
+                created INTEGER NOT NULL
+            );
+            INSERT INTO pending_submissions VALUES
+                ('prepared','term','traex','session','a','prepared',1),
+                ('consumed','term','traex','session','b','consumed',2);
+            PRAGMA user_version=1;",
+        )
+        .unwrap();
+        drop(db);
+
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal.submission_receipt("prepared").unwrap().state,
+            AgentEventsSubmissionState::Uncertain
+        );
+        assert_eq!(
+            journal.submission_receipt("consumed").unwrap().state,
+            AgentEventsSubmissionState::Accepted
+        );
+        drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

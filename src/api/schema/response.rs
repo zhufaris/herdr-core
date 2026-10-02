@@ -105,6 +105,8 @@ pub enum ResponseResult {
         agent: AgentInfo,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submission_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_receipt: Option<super::agent_events::AgentEventsSubmissionReceipt>,
     },
     AgentList {
         agents: Vec<AgentInfo>,
@@ -125,6 +127,10 @@ pub enum ResponseResult {
     AgentEventsTurnCursor {
         #[serde(flatten)]
         boundary: super::agent_events::AgentEventsTurnCursor,
+    },
+    AgentEventsSubmissionReceipt {
+        #[serde(flatten)]
+        receipt: super::agent_events::AgentEventsSubmissionReceipt,
     },
     AgentView {
         active: bool,

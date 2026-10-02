@@ -234,7 +234,8 @@ fn handle_connection_with_events(
         Method::AgentEventsAttach(_)
         | Method::AgentEventsSources(_)
         | Method::AgentEventsRead(_)
-        | Method::AgentEventsLocate(_) => {
+        | Method::AgentEventsLocate(_)
+        | Method::AgentEventsSubmission(_) => {
             let source_id = match &request.method {
                 Method::AgentEventsRead(params) => Some(params.source_id.clone()),
                 Method::AgentEventsLocate(params) => Some(params.source_id.clone()),
@@ -249,6 +250,9 @@ fn handle_connection_with_events(
                     Method::AgentEventsLocate(params) => service
                         .locate(&params)
                         .map(|boundary| ResponseResult::AgentEventsTurnCursor { boundary }),
+                    Method::AgentEventsSubmission(params) => service
+                        .submission(&params)
+                        .map(|receipt| ResponseResult::AgentEventsSubmissionReceipt { receipt }),
                     _ => service.sources(),
                 },
                 None => Err(crate::agent_events::EventError("events_unavailable")),
@@ -323,10 +327,23 @@ fn handle_connection_with_events(
                 match prepared {
                     Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
                     Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
-                        return write_json_line_allow_disconnect(
-                            &mut stream,
-                            &agent_events::failure(&request_id, "submission_duplicate"),
-                        );
+                        let result = reply_streams
+                            .ok_or(crate::agent_events::EventError("events_unavailable"))
+                            .and_then(|service| {
+                                service.submission(
+                                    &crate::api::schema::agent_events::AgentEventsSubmissionParams {
+                                        submission_id: submission_id.clone().unwrap(),
+                                    },
+                                )
+                            });
+                        let response = match result {
+                            Ok(receipt) => serde_json::json!({
+                                "id": request_id,
+                                "result": ResponseResult::AgentEventsSubmissionReceipt { receipt }
+                            }),
+                            Err(error) => agent_events::failure(&request_id, error.0),
+                        };
+                        return write_json_line_allow_disconnect(&mut stream, &response);
                     }
                     Err(error) => {
                         return write_json_line_allow_disconnect(
@@ -336,37 +353,42 @@ fn handle_connection_with_events(
                     }
                 }
             }
-            let response = prompt_agent(
+            let prompt_result = match prompt_agent(
                 request_id.clone(),
                 params,
                 &mut stream,
                 api_tx,
                 event_hub,
                 running,
-            )?;
-            if let (Some(service), Some(submission_id), Some(response)) =
-                (reply_streams, submission_id.as_deref(), response.as_deref())
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let (Some(service), Some(submission_id)) =
+                        (reply_streams, submission_id.as_deref())
+                    {
+                        let _ = service.settle_submission(
+                            submission_id,
+                            crate::api::schema::agent_events::AgentEventsSubmissionState::Uncertain,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let mut response = prompt_result.response;
+            if let (Some(service), Some(submission_id)) = (reply_streams, submission_id.as_deref())
             {
-                let code = serde_json::from_str::<serde_json::Value>(response)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .pointer("/error/code")
-                            .and_then(|code| code.as_str())
-                            .map(str::to_owned)
-                    });
-                if matches!(
-                    code.as_deref(),
-                    Some(
-                        "empty_agent_prompt"
-                            | "invalid_agent_prompt"
-                            | "agent_not_found"
-                            | "agent_not_ready"
-                            | "agent_blocked"
-                            | "agent_session_changed"
-                    )
-                ) {
-                    let _ = service.cancel_prepared_submission(submission_id);
+                let outcome =
+                    submission_outcome_for_response(prompt_result.submission_response.as_deref());
+                match service.settle_submission(submission_id, outcome) {
+                    Ok(receipt) if outcome == crate::api::schema::agent_events::AgentEventsSubmissionState::Accepted => {
+                        attach_submission_receipt(&mut response, &receipt);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        response = Some(
+                            agent_events::failure(&request_id, error.0).to_string(),
+                        );
+                    }
                 }
             }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
@@ -391,20 +413,6 @@ fn handle_connection_with_events(
             else {
                 return write_text_line_allow_disconnect(&mut stream, &before);
             };
-            let begin_response = dispatch_to_app_with_timeout(
-                Request {
-                    id: request_id.clone(),
-                    method: Method::AgentPromptModel(params.clone()),
-                },
-                api_tx,
-                None,
-            );
-            if serde_json::from_str::<serde_json::Value>(&begin_response)
-                .ok()
-                .is_none_or(|value| value.get("error").is_some())
-            {
-                return write_text_line_allow_disconnect(&mut stream, &begin_response);
-            }
             let submission_params = crate::api::schema::AgentPromptParams {
                 target: params.target.clone(),
                 text: params.text.clone(),
@@ -419,10 +427,23 @@ fn handle_connection_with_events(
             match prepared {
                 Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
                 Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
-                    return write_json_line_allow_disconnect(
-                        &mut stream,
-                        &agent_events::failure(&request_id, "submission_duplicate"),
-                    );
+                    let result = reply_streams
+                        .ok_or(crate::agent_events::EventError("events_unavailable"))
+                        .and_then(|service| {
+                            service.submission(
+                                &crate::api::schema::agent_events::AgentEventsSubmissionParams {
+                                    submission_id: params.submission_id.clone(),
+                                },
+                            )
+                        });
+                    let response = match result {
+                        Ok(receipt) => serde_json::json!({
+                            "id": request_id,
+                            "result": ResponseResult::AgentEventsSubmissionReceipt { receipt }
+                        }),
+                        Err(error) => agent_events::failure(&request_id, error.0),
+                    };
+                    return write_json_line_allow_disconnect(&mut stream, &response);
                 }
                 Err(error) => {
                     return write_json_line_allow_disconnect(
@@ -431,15 +452,62 @@ fn handle_connection_with_events(
                     );
                 }
             }
-            let response = prompt_agent_after_model_resume(
+            let begin_response = dispatch_to_app_with_timeout(
+                Request {
+                    id: request_id.clone(),
+                    method: Method::AgentPromptModel(params.clone()),
+                },
+                api_tx,
+                None,
+            );
+            if serde_json::from_str::<serde_json::Value>(&begin_response)
+                .ok()
+                .is_none_or(|value| value.get("error").is_some())
+            {
+                if let Some(service) = reply_streams {
+                    let _ = service.settle_submission(
+                        &params.submission_id,
+                        crate::api::schema::agent_events::AgentEventsSubmissionState::Rejected,
+                    );
+                }
+                return write_text_line_allow_disconnect(&mut stream, &begin_response);
+            }
+            let prompt_result = match prompt_agent_after_model_resume(
                 request_id.clone(),
-                params,
+                params.clone(),
                 expected_terminal_id,
                 &mut stream,
                 api_tx,
                 event_hub,
                 running,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(service) = reply_streams {
+                        let _ = service.settle_submission(
+                            &params.submission_id,
+                            crate::api::schema::agent_events::AgentEventsSubmissionState::Uncertain,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let mut response = prompt_result.response;
+            if let Some(service) = reply_streams {
+                let outcome =
+                    submission_outcome_for_response(prompt_result.submission_response.as_deref());
+                match service.settle_submission(&params.submission_id, outcome) {
+                    Ok(receipt) if outcome == crate::api::schema::agent_events::AgentEventsSubmissionState::Accepted => {
+                        attach_submission_receipt(&mut response, &receipt);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        response = Some(
+                            agent_events::failure(&request_id, error.0).to_string(),
+                        );
+                    }
+                }
+            }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         Method::AgentWait(params) => {
@@ -664,6 +732,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentEventsSources(_) => "agent.events.sources",
         Method::AgentEventsRead(_) => "agent.events.read",
         Method::AgentEventsLocate(_) => "agent.events.locate",
+        Method::AgentEventsSubmission(_) => "agent.events.submission",
         Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
@@ -1130,6 +1199,78 @@ fn caller_timeout_dispatch_uses_timeout_error() {
     assert_eq!(error.error.code, "timeout");
 }
 
+#[cfg(test)]
+#[test]
+fn submission_outcome_uses_only_the_pty_receipt_boundary() {
+    use crate::api::schema::agent_events::AgentEventsSubmissionState;
+
+    assert_eq!(
+        submission_outcome_for_response(Some(r#"{"id":"p","result":{"type":"agent_prompted"}}"#)),
+        AgentEventsSubmissionState::Accepted
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_not_ready","message":"not ready"}}"#
+        )),
+        AgentEventsSubmissionState::Rejected
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_prompt_not_submitted","message":"closed"}}"#
+        )),
+        AgentEventsSubmissionState::Rejected
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_prompt_failed","message":"write failed"}}"#
+        )),
+        AgentEventsSubmissionState::Uncertain
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"timeout","message":"completion unknown"}}"#
+        )),
+        AgentEventsSubmissionState::Uncertain
+    );
+    assert_eq!(
+        submission_outcome_for_response(None),
+        AgentEventsSubmissionState::Uncertain
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_receipt_is_embedded_in_the_prompt_response() {
+    use crate::api::schema::agent_events::{
+        AgentEventsSubmissionReceipt, AgentEventsSubmissionState, TranscriptKind,
+    };
+
+    let mut response =
+        Some(r#"{"id":"p","result":{"type":"agent_prompted","submission_id":"prompt-1"}}"#.into());
+    attach_submission_receipt(
+        &mut response,
+        &AgentEventsSubmissionReceipt {
+            submission_id: "prompt-1".into(),
+            terminal_id: "terminal-1".into(),
+            agent_kind: TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            state: AgentEventsSubmissionState::Accepted,
+            created_at: 10,
+            updated_at: 11,
+        },
+    );
+
+    let value: serde_json::Value = serde_json::from_str(response.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        value.pointer("/result/submission_receipt/state"),
+        Some(&serde_json::json!("accepted"))
+    );
+    assert_eq!(
+        value.pointer("/result/submission_receipt/submission_id"),
+        Some(&serde_json::json!("prompt-1"))
+    );
+}
+
 fn error_response_json(id: String, code: &str, message: String) -> String {
     serde_json::to_string(&ErrorResponse {
         id,
@@ -1142,6 +1283,64 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
         r#"{"id":"","error":{"code":"internal_error","message":"failed to encode error response"}}"#
             .to_string()
     })
+}
+
+fn submission_outcome_for_response(
+    response: Option<&str>,
+) -> crate::api::schema::agent_events::AgentEventsSubmissionState {
+    use crate::api::schema::agent_events::AgentEventsSubmissionState;
+
+    let Some(value) = response.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return AgentEventsSubmissionState::Uncertain;
+    };
+    if value
+        .pointer("/result/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_prompted")
+    {
+        return AgentEventsSubmissionState::Accepted;
+    }
+    match value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(
+            "empty_agent_prompt"
+            | "invalid_agent_prompt"
+            | "agent_not_found"
+            | "agent_not_ready"
+            | "agent_blocked"
+            | "agent_session_changed"
+            | "agent_prompt_not_submitted"
+            | "agent_model_resume_timeout"
+            | "agent_not_running",
+        ) => AgentEventsSubmissionState::Rejected,
+        _ => AgentEventsSubmissionState::Uncertain,
+    }
+}
+
+fn attach_submission_receipt(
+    response: &mut Option<String>,
+    receipt: &crate::api::schema::agent_events::AgentEventsSubmissionReceipt,
+) {
+    let Some(raw) = response.as_deref() else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(result) = value
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    result.insert(
+        "submission_receipt".into(),
+        serde_json::to_value(receipt).expect("submission receipt serializes"),
+    );
+    *response = Some(value.to_string());
 }
 
 #[cfg(all(test, unix))]

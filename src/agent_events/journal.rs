@@ -102,6 +102,18 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, definition TEXT NOT NULL, checkpoint TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', error TEXT, floor INTEGER NOT NULL DEFAULT 0, latest INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE(source,key));
             CREATE INDEX IF NOT EXISTS events_source_seq ON events(source,seq);")?;
+        let pending_submission_columns = {
+            let mut statement = db.prepare("PRAGMA table_info(pending_submissions)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            columns
+        };
+        let has_pending_submission_column = |name: &str| {
+            pending_submission_columns
+                .iter()
+                .any(|column| column == name)
+        };
         if version == 0 {
             db.execute_batch("CREATE TABLE pending_submissions (
                 submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
@@ -143,7 +155,48 @@ impl Journal {
                 CREATE INDEX turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
                 PRAGMA user_version=2;
                 COMMIT;")?;
+        } else if has_pending_submission_column("correlated")
+            && !has_pending_submission_column("transcript_id")
+        {
+            // The stream-only v2 converted any prepared receipt to uncertain on reopen,
+            // so none of its states prove that a prompt is safe to submit again.
+            db.execute_batch("BEGIN IMMEDIATE;
+                DROP INDEX IF EXISTS pending_submissions_match;
+                ALTER TABLE pending_submissions RENAME TO pending_submissions_stream_v2;
+                CREATE TABLE pending_submissions (
+                  submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
+                  session_id TEXT NOT NULL, text_digest TEXT NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','observed','terminal','cancelled','legacy_unavailable')),
+                  transcript_id TEXT, turn_id TEXT, turn_started_at TEXT, human_event_key TEXT,
+                  terminal_state TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created,updated)
+                  SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
+                    'legacy_unavailable',created,updated
+                  FROM pending_submissions_stream_v2;
+                DROP TABLE pending_submissions_stream_v2;
+                CREATE INDEX pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
+                CREATE TABLE IF NOT EXISTS turn_index (
+                  transcript_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                  source_definition TEXT NOT NULL, turn_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                  start_checkpoint TEXT NOT NULL, end_checkpoint TEXT, terminal_state TEXT,
+                  human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
+                  PRIMARY KEY(transcript_id,turn_id,started_at));
+                CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
+                COMMIT;")?;
         } else {
+            if ![
+                "transcript_id",
+                "turn_id",
+                "turn_started_at",
+                "human_event_key",
+                "terminal_state",
+                "updated",
+            ]
+            .into_iter()
+            .all(has_pending_submission_column)
+            {
+                return Err(EventError("journal_unavailable"));
+            }
             db.execute_batch("CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
                 CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);")?;
         }
@@ -1618,6 +1671,101 @@ mod tests {
         assert!(receipt.turn_id.is_none());
         assert!(receipt.started_at.is_none());
         drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stream_only_version_two_migrates_without_fabricating_turn_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-stream-v2-migration-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE pending_submissions (
+                    submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                    text_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                    correlated INTEGER NOT NULL DEFAULT 0 CHECK(correlated IN (0,1)),
+                    created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                 CREATE INDEX pending_submissions_match
+                    ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,correlated,created);
+                 INSERT INTO pending_submissions VALUES
+                    ('prepared','term','traex','session','digest-1','prepared',0,1,2),
+                    ('accepted','term','traex','session','digest-2','accepted',1,3,4),
+                    ('rejected','term','traex','session','digest-3','rejected',0,5,6),
+                    ('uncertain','term','traex','session','digest-4','uncertain',0,7,8);
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        }
+
+        let mut journal = Journal::open(&path).unwrap();
+        let columns = journal
+            .db
+            .prepare("PRAGMA table_info(pending_submissions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"transcript_id".to_owned()));
+        assert!(columns.contains(&"turn_id".to_owned()));
+        assert!(columns.contains(&"turn_started_at".to_owned()));
+        assert!(columns.contains(&"human_event_key".to_owned()));
+        assert!(columns.contains(&"terminal_state".to_owned()));
+        assert!(!columns.contains(&"correlated".to_owned()));
+
+        for submission_id in ["prepared", "accepted", "rejected", "uncertain"] {
+            let receipt = journal
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: submission_id.into(),
+                })
+                .unwrap();
+            assert_eq!(receipt.state, AgentEventsSubmissionState::LegacyUnavailable);
+            assert!(receipt.turn_id.is_none());
+            assert!(receipt.started_at.is_none());
+            assert!(receipt.terminal_state.is_none());
+        }
+
+        let turns = journal
+            .turns(&AgentEventsListTurnsParams {
+                agent_kind: TranscriptKind::Traex,
+                session_id: "session".into(),
+                after: None,
+                limit: 128,
+            })
+            .unwrap();
+        assert!(turns.turns.is_empty());
+        assert!(turns.complete);
+        let recovered = journal
+            .recover_turn(&AgentEventsRecoverTurnParams {
+                agent_kind: TranscriptKind::Traex,
+                session_id: "session".into(),
+                turn_id: "missing-turn".into(),
+                started_at: "2026-10-02T00:00:00Z".into(),
+                after: None,
+                limit: 128,
+            })
+            .unwrap();
+        assert_eq!(recovered.outcome, AgentEventsRecoveryOutcome::NotFound);
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: "accepted".into(),
+                })
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::LegacyUnavailable
+        );
+        drop(reopened);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

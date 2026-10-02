@@ -2923,6 +2923,69 @@
           ],
           "type": "object"
         },
+        "PaneIdentity": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "token"
+          ],
+          "type": "object"
+        },
+        "PaneIdentityReconcileTarget": {
+          "properties": {
+            "expected_workspace_label": {
+              "type": "string"
+            },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "expected_workspace_label",
+            "token"
+          ],
+          "type": "object"
+        },
+        "PaneIdentityReconcileV1Params": {
+          "properties": {
+            "expected": {
+              "$ref": "#/schemas/request/$defs/PaneIdentity"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/schemas/request/$defs/PaneIdentityReconcileTarget"
+            }
+          },
+          "required": [
+            "operation_id",
+            "expected",
+            "target"
+          ],
+          "type": "object"
+        },
         "PaneInputSetParams": {
           "properties": {
             "pane_id": {
@@ -5910,6 +5973,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.identity_reconcile.v1",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneIdentityReconcileV1Params"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.zoom",
               "type": "string"
             },
@@ -8769,6 +8848,60 @@
           ],
           "type": "object"
         },
+        "PaneIdentity": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "token"
+          ],
+          "type": "object"
+        },
+        "PaneIdentityReconcileDisposition": {
+          "enum": [
+            "applied",
+            "already_converged"
+          ],
+          "type": "string"
+        },
+        "PaneIdentityReconcileReceipt": {
+          "properties": {
+            "current": {
+              "$ref": "#/schemas/success_response/$defs/PaneIdentity"
+            },
+            "disposition": {
+              "$ref": "#/schemas/success_response/$defs/PaneIdentityReconcileDisposition"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "previous": {
+              "$ref": "#/schemas/success_response/$defs/PaneIdentity"
+            }
+          },
+          "required": [
+            "operation_id",
+            "disposition",
+            "previous",
+            "current"
+          ],
+          "type": "object"
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
@@ -11042,6 +11175,22 @@
             },
             {
               "properties": {
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/PaneIdentityReconcileReceipt"
+                },
+                "type": {
+                  "const": "pane_identity_reconcile",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "receipt"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "pane_zoom",
                   "type": "string"
@@ -11862,6 +12011,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "pane_identity_reconcile_v1": {
+              "default": false,
+              "description": "Whether this server supports idempotent in-place Pane identity reconciliation.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

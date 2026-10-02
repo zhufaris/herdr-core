@@ -40,14 +40,20 @@ impl SessionWriter {
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
-        let result = self.preserve_unloaded().and_then(|()| {
+        if let Err(err) = self.save_checked(snapshot, history) {
+            crate::logging::session_save_failed(&self.path, &err.to_string());
+        }
+    }
+
+    pub(crate) fn save_checked(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
+        self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::save_to_path(&self.path, snapshot)
-        });
-        if let Err(err) = result {
-            crate::logging::session_save_failed(&self.path, &err.to_string());
-            return;
-        }
+        })?;
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
         self.preserve_snapshot_history();
@@ -56,6 +62,7 @@ impl SessionWriter {
             crate::logging::session_save_failed(&history_path, &err.to_string());
         }
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {

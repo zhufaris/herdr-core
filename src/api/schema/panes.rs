@@ -80,6 +80,45 @@ pub struct PaneMoveParams {
     pub focus: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneIdentity {
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    #[schemars(regex(pattern = r"^[0-9a-z]{4}$"))]
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneIdentityReconcileTarget {
+    pub workspace_id: String,
+    pub expected_workspace_label: String,
+    #[schemars(regex(pattern = r"^[0-9a-z]{4}$"))]
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneIdentityReconcileV1Params {
+    pub operation_id: String,
+    pub expected: PaneIdentity,
+    pub target: PaneIdentityReconcileTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneIdentityReconcileDisposition {
+    Applied,
+    AlreadyConverged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneIdentityReconcileReceipt {
+    pub operation_id: String,
+    pub disposition: PaneIdentityReconcileDisposition,
+    pub previous: PaneIdentity,
+    pub current: PaneIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PaneMoveDestination {

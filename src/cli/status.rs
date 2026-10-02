@@ -427,6 +427,7 @@ mod tests {
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
+                pane_identity_reconcile_v1: true,
             }),
         }
     }

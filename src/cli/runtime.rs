@@ -1,9 +1,10 @@
 use crate::api::schema::{
-    EmptyParams, Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams,
-    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, Request, TabCreateParams, TabCreateV2Params, TabListParams, TabRenameParams,
-    TabTarget, WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    EmptyParams, Method, PaneFocusDirectionParams, PaneIdentityReconcileV1Params,
+    PaneInputSetParams, PaneMoveParams, PaneRenameParams, PaneResizeParams, PaneSplitParams,
+    PaneSwapParams, PaneTarget, PaneZoomParams, Request, TabCreateParams, TabCreateV2Params,
+    TabListParams, TabRenameParams, TabTarget, WorkspaceCloseParams, WorkspaceCreateParams,
+    WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams, WorktreeListParams,
+    WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -120,6 +121,15 @@ pub(super) fn pane_swap(params: PaneSwapParams) -> std::io::Result<i32> {
 
 pub(super) fn pane_move(params: PaneMoveParams) -> std::io::Result<i32> {
     print_method_response("cli:pane:move", Method::PaneMove(params))
+}
+
+pub(super) fn pane_identity_reconcile_v1(
+    params: PaneIdentityReconcileV1Params,
+) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:pane:identity-reconcile:v1",
+        Method::PaneIdentityReconcileV1(params),
+    )
 }
 
 pub(super) fn pane_close(pane_id: String) -> std::io::Result<i32> {

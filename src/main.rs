@@ -36,6 +36,7 @@ mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
+mod pane_identity_journal;
 use ghostty_vt::pane_graphics_files;
 mod persist;
 mod platform;

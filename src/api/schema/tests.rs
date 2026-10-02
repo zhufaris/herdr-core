@@ -217,6 +217,78 @@ fn tab_create_v2_contract_round_trips_without_changing_legacy_creation() {
 }
 
 #[test]
+fn pane_identity_reconcile_v1_contract_round_trips() {
+    let expected = PaneIdentity {
+        pane_id: "wN:p5M".into(),
+        terminal_id: "term_65cdc411e6bd412".into(),
+        workspace_id: "wN".into(),
+        token: "ri18".into(),
+    };
+    let request = Request {
+        id: "reconcile-orchestrator".into(),
+        method: Method::PaneIdentityReconcileV1(PaneIdentityReconcileV1Params {
+            operation_id: "orchestrator-identity-1".into(),
+            expected: expected.clone(),
+            target: PaneIdentityReconcileTarget {
+                workspace_id: "w4".into(),
+                expected_workspace_label: "herdr".into(),
+                token: "orch".into(),
+            },
+        }),
+    };
+
+    let request_json = serde_json::to_value(&request).unwrap();
+    assert_eq!(request_json["method"], "pane.identity_reconcile.v1");
+    assert_eq!(
+        request_json["params"]["operation_id"],
+        "orchestrator-identity-1"
+    );
+    assert_eq!(
+        request_json["params"]["expected"],
+        serde_json::json!({
+            "pane_id": "wN:p5M",
+            "terminal_id": "term_65cdc411e6bd412",
+            "workspace_id": "wN",
+            "token": "ri18"
+        })
+    );
+    assert_eq!(
+        request_json["params"]["target"],
+        serde_json::json!({
+            "workspace_id": "w4",
+            "expected_workspace_label": "herdr",
+            "token": "orch"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(request_json).unwrap(),
+        request
+    );
+
+    let receipt = PaneIdentityReconcileReceipt {
+        operation_id: "orchestrator-identity-1".into(),
+        disposition: PaneIdentityReconcileDisposition::Applied,
+        previous: expected,
+        current: PaneIdentity {
+            pane_id: "w4:p2".into(),
+            terminal_id: "term_65cdc411e6bd412".into(),
+            workspace_id: "w4".into(),
+            token: "orch".into(),
+        },
+    };
+    let response = ResponseResult::PaneIdentityReconcile {
+        receipt: receipt.clone(),
+    };
+    let response_json = serde_json::to_value(&response).unwrap();
+    assert_eq!(response_json["type"], "pane_identity_reconcile");
+    assert_eq!(response_json["receipt"]["disposition"], "applied");
+    assert_eq!(
+        serde_json::from_value::<ResponseResult>(response_json).unwrap(),
+        response
+    );
+}
+
+#[test]
 fn agent_session_rotation_v1_contract_round_trips() {
     let request = Request {
         id: "rotate".into(),
@@ -338,13 +410,18 @@ fn agent_session_rotation_v1_contract_round_trips() {
         ssh_agent_registration: false,
         agent_session_rotation_v1: true,
         tab_create_v2: true,
+        pane_identity_reconcile_v1: true,
     };
     assert_eq!(
         serde_json::to_value(&capabilities).unwrap()["agent_session_rotation_v1"],
         true
     );
     assert_eq!(
-        serde_json::to_value(capabilities).unwrap()["tab_create_v2"],
+        serde_json::to_value(&capabilities).unwrap()["tab_create_v2"],
+        true
+    );
+    assert_eq!(
+        serde_json::to_value(capabilities).unwrap()["pane_identity_reconcile_v1"],
         true
     );
 }
@@ -947,6 +1024,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
+                pane_identity_reconcile_v1: true,
             }),
         },
     };

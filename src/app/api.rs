@@ -1148,6 +1148,9 @@ impl App {
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
+            Method::PaneIdentityReconcileV1(params) => {
+                return self.handle_pane_identity_reconcile_v1(request.id, params)
+            }
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
             Method::PaneProcessInfo(params) => {

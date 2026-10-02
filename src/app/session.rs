@@ -102,6 +102,35 @@ impl App {
         self.session_save_deadline = None;
     }
 
+    pub(crate) fn save_session_now_checked(&mut self) -> std::io::Result<()> {
+        if let Some(thread) = self.session_save_thread.take() {
+            let _ = thread.join();
+        }
+        if !self.policy.persist_session {
+            self.session_save_deadline = None;
+            return Ok(());
+        }
+        let job = self.capture_session_save_job();
+        let mut writer = self
+            .session_writer
+            .lock()
+            .map_err(|err| std::io::Error::other(format!("session writer is poisoned: {err}")))?;
+        match job {
+            SessionSaveJob::Clear => {
+                return Err(std::io::Error::other(
+                    "identity reconciliation cannot persist an empty session",
+                ))
+            }
+            SessionSaveJob::Save { snapshot, history } => {
+                writer.save_checked(&snapshot, history.as_ref())?;
+            }
+        }
+        self.pane_exit_checkpoint_pending = false;
+        self.session_save_deadline = None;
+        self.state.session_dirty = false;
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
         if !self.policy.persist_session
             || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)

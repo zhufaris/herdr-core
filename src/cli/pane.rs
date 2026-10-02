@@ -1,6 +1,7 @@
 use crate::api::schema::{
     Method, OutputMatch, PaneCurrentParams, PaneDirection, PaneEdgesParams,
-    PaneFocusDirectionParams, PaneInputSetParams, PaneLayoutParams, PaneListParams,
+    PaneFocusDirectionParams, PaneIdentity, PaneIdentityReconcileTarget,
+    PaneIdentityReconcileV1Params, PaneInputSetParams, PaneLayoutParams, PaneListParams,
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
@@ -32,6 +33,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "split" => pane_split(&args[1..]),
         "swap" => pane_swap(&args[1..]),
         "move" => pane_move(&args[1..]),
+        "identity-reconcile" => pane_identity_reconcile(&args[1..]),
         "close" => pane_close(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
@@ -761,6 +763,71 @@ fn pane_move(args: &[String]) -> std::io::Result<i32> {
     };
 
     super::runtime::pane_move(params)
+}
+
+fn pane_identity_reconcile(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_pane_identity_reconcile_args(args) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+    super::runtime::pane_identity_reconcile_v1(params)
+}
+
+fn parse_pane_identity_reconcile_args(
+    args: &[String],
+) -> Result<PaneIdentityReconcileV1Params, String> {
+    let mut values = std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if !matches!(
+            option,
+            "--operation-id"
+                | "--expected-pane"
+                | "--expected-terminal"
+                | "--expected-workspace"
+                | "--expected-token"
+                | "--target-workspace"
+                | "--expected-workspace-label"
+                | "--token"
+        ) {
+            return Err(format!("unknown option: {option}"));
+        }
+        let Some(value) = args.get(index + 1) else {
+            return Err(format!("missing value for {option}"));
+        };
+        if values.insert(option, value.clone()).is_some() {
+            return Err(format!("duplicate option: {option}"));
+        }
+        index += 2;
+    }
+    let required = |name: &'static str| {
+        values
+            .get(name)
+            .cloned()
+            .ok_or_else(pane_identity_reconcile_usage)
+    };
+    Ok(PaneIdentityReconcileV1Params {
+        operation_id: required("--operation-id")?,
+        expected: PaneIdentity {
+            pane_id: super::normalize_pane_id(&required("--expected-pane")?),
+            terminal_id: required("--expected-terminal")?,
+            workspace_id: super::normalize_workspace_id(&required("--expected-workspace")?),
+            token: required("--expected-token")?,
+        },
+        target: PaneIdentityReconcileTarget {
+            workspace_id: super::normalize_workspace_id(&required("--target-workspace")?),
+            expected_workspace_label: required("--expected-workspace-label")?,
+            token: required("--token")?,
+        },
+    })
+}
+
+fn pane_identity_reconcile_usage() -> String {
+    "usage: herdr pane identity-reconcile --operation-id ID --expected-pane ID --expected-terminal ID --expected-workspace ID --expected-token TOKEN --target-workspace ID --expected-workspace-label TEXT --token TOKEN".into()
 }
 
 fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
@@ -1694,6 +1761,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
+    eprintln!("  herdr pane identity-reconcile --operation-id ID --expected-pane ID --expected-terminal ID --expected-workspace ID --expected-token TOKEN --target-workspace ID --expected-workspace-label TEXT --token TOKEN");
     eprintln!("  herdr pane close <pane_id>");
     eprintln!("  herdr pane send-text <pane_id> <text>");
     eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
@@ -1937,6 +2005,38 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("invalid ratio"));
+    }
+
+    #[test]
+    fn parse_pane_identity_reconcile_args_requires_and_preserves_all_fences() {
+        let params = parse_pane_identity_reconcile_args(&args(&[
+            "--operation-id",
+            "identity-1",
+            "--expected-pane",
+            "wN:p5M",
+            "--expected-terminal",
+            "term_65cdc411e6bd412",
+            "--expected-workspace",
+            "wN",
+            "--expected-token",
+            "ri18",
+            "--target-workspace",
+            "w4",
+            "--expected-workspace-label",
+            "herdr",
+            "--token",
+            "orch",
+        ]))
+        .unwrap();
+
+        assert_eq!(params.operation_id, "identity-1");
+        assert_eq!(params.expected.pane_id, "wN:p5M");
+        assert_eq!(params.expected.terminal_id, "term_65cdc411e6bd412");
+        assert_eq!(params.expected.workspace_id, "wN");
+        assert_eq!(params.expected.token, "ri18");
+        assert_eq!(params.target.workspace_id, "w4");
+        assert_eq!(params.target.expected_workspace_label, "herdr");
+        assert_eq!(params.target.token, "orch");
     }
 
     #[test]

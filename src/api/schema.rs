@@ -152,6 +152,8 @@ pub enum Method {
     PaneSwap(PaneSwapParams),
     #[serde(rename = "pane.move")]
     PaneMove(PaneMoveParams),
+    #[serde(rename = "pane.identity_reconcile.v1")]
+    PaneIdentityReconcileV1(PaneIdentityReconcileV1Params),
     #[serde(rename = "pane.zoom")]
     PaneZoom(PaneZoomParams),
     #[serde(rename = "pane.layout")]

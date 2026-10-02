@@ -640,6 +640,18 @@ fn pane_command() -> Command {
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
+        .subcommand(
+            Command::new("identity-reconcile")
+                .about("Atomically reconcile an existing pane's native identity")
+                .arg(option("operation-id", "ID").required(true))
+                .arg(option("expected-pane", "ID").required(true))
+                .arg(option("expected-terminal", "ID").required(true))
+                .arg(option("expected-workspace", "ID").required(true))
+                .arg(option("expected-token", "TOKEN").required(true))
+                .arg(option("target-workspace", "ID").required(true))
+                .arg(option("expected-workspace-label", "TEXT").required(true))
+                .arg(option("token", "TOKEN").required(true)),
+        )
         .subcommand(id_command("close", "pane_id", "Close a pane"))
         .subcommand(
             Command::new("send-text")
@@ -1368,6 +1380,24 @@ mod tests {
         assert!(has_option(tab_create, "workspace"));
         assert!(has_option(tab_create, "expected-workspace-label"));
         assert!(has_option(tab_create, "token"));
+    }
+
+    #[test]
+    fn spec_models_pane_identity_reconciliation_fences() {
+        let cmd = super::command();
+        let reconcile = command_path(&cmd, &["pane", "identity-reconcile"]);
+        for option in [
+            "operation-id",
+            "expected-pane",
+            "expected-terminal",
+            "expected-workspace",
+            "expected-token",
+            "target-workspace",
+            "expected-workspace-label",
+            "token",
+        ] {
+            assert!(has_option(reconcile, option), "missing --{option}");
+        }
     }
 
     #[test]

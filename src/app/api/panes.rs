@@ -4,12 +4,13 @@ use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
     PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
-    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneIdentity,
+    PaneIdentityReconcileDisposition, PaneIdentityReconcileReceipt, PaneIdentityReconcileV1Params,
+    PaneInfo, PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect,
+    PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams,
+    PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo,
+    PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
+    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
     PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
@@ -31,6 +32,427 @@ use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    pub(super) fn handle_pane_identity_reconcile_v1(
+        &mut self,
+        id: String,
+        params: PaneIdentityReconcileV1Params,
+    ) -> String {
+        if !valid_identity_operation_id(&params.operation_id) {
+            return encode_error(id, "invalid_operation_id", "invalid operation id");
+        }
+        let mut journal = match crate::pane_identity_journal::PaneIdentityJournal::open(
+            self.pane_identity_journal_path.clone(),
+        ) {
+            Ok(journal) => journal,
+            Err(err) => {
+                return encode_error(
+                    id,
+                    "pane_identity_journal_unavailable",
+                    format!("pane identity journal is unavailable: {err}"),
+                )
+            }
+        };
+        let operation_was_new = match journal.begin(&params) {
+            Ok(crate::pane_identity_journal::OperationState::Completed(receipt)) => {
+                let current = self
+                    .find_pane_by_terminal_id(&receipt.current.terminal_id)
+                    .and_then(|(ws_idx, pane_id)| self.pane_identity(ws_idx, pane_id));
+                if current.as_ref() != Some(&receipt.current) {
+                    return encode_error(
+                        id,
+                        "pane_identity_reconcile_uncertain",
+                        "stored receipt does not match current pane identity",
+                    );
+                }
+                return encode_success(id, ResponseResult::PaneIdentityReconcile { receipt });
+            }
+            Ok(crate::pane_identity_journal::OperationState::Rejected { code, message }) => {
+                return encode_error(id, &code, message)
+            }
+            Ok(crate::pane_identity_journal::OperationState::Conflict) => {
+                return encode_error(
+                    id,
+                    "operation_id_reused",
+                    "operation id was reused with a different identity request",
+                )
+            }
+            Ok(crate::pane_identity_journal::OperationState::New) => true,
+            Ok(crate::pane_identity_journal::OperationState::Pending) => false,
+            Err(err) => {
+                return encode_error(
+                    id,
+                    "pane_identity_journal_unavailable",
+                    format!("pane identity operation could not be recorded: {err}"),
+                )
+            }
+        };
+
+        let requested_token = match crate::pane::PaneToken::parse(&params.target.token) {
+            Some(token) => token,
+            None => {
+                return reject_identity_reconcile(
+                    id,
+                    &mut journal,
+                    &params,
+                    "invalid_pane_token",
+                    "pane token must contain exactly four lowercase base36 characters",
+                )
+            }
+        };
+        if crate::pane::PaneToken::parse(&params.expected.token).is_none() {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "stale_source_identity",
+                "expected source token is invalid",
+            );
+        }
+        let Some(target_ws_idx) = self.parse_workspace_id(&params.target.workspace_id) else {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "workspace_not_found",
+                "target workspace not found",
+            );
+        };
+        let actual_target_label = self.workspace_info(target_ws_idx).label;
+        let token_conflict = self.state.workspaces.iter().any(|workspace| {
+            workspace.tabs.iter().any(|tab| {
+                tab.panes.values().any(|pane| {
+                    pane.token == requested_token
+                        && pane.attached_terminal_id.to_string() != params.expected.terminal_id
+                })
+            })
+        });
+        if token_conflict {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "pane_token_conflict",
+                "requested pane token is already in use",
+            );
+        }
+
+        if let Some((current_ws_idx, current_pane_id)) =
+            self.find_pane_by_terminal_id(&params.expected.terminal_id)
+        {
+            if current_ws_idx == target_ws_idx
+                && self.state.workspaces[current_ws_idx]
+                    .pane_state(current_pane_id)
+                    .is_some_and(|pane| pane.token == requested_token)
+            {
+                let Some(current) = self.pane_identity(current_ws_idx, current_pane_id) else {
+                    return encode_error(
+                        id,
+                        "pane_identity_unavailable",
+                        "converged pane identity is unavailable",
+                    );
+                };
+                if operation_was_new && current != params.expected {
+                    return reject_identity_reconcile(
+                        id,
+                        &mut journal,
+                        &params,
+                        "stale_source_identity",
+                        "source pane identity no longer matches",
+                    );
+                }
+                if operation_was_new
+                    && actual_target_label != params.target.expected_workspace_label
+                {
+                    return reject_identity_reconcile(
+                        id,
+                        &mut journal,
+                        &params,
+                        "workspace_label_mismatch",
+                        "target workspace label no longer matches",
+                    );
+                }
+                let disposition = if current == params.expected {
+                    PaneIdentityReconcileDisposition::AlreadyConverged
+                } else {
+                    PaneIdentityReconcileDisposition::Applied
+                };
+                let receipt = PaneIdentityReconcileReceipt {
+                    operation_id: params.operation_id.clone(),
+                    disposition,
+                    previous: params.expected.clone(),
+                    current,
+                };
+                self.state.mark_session_dirty();
+                if let Err(err) = self.save_session_now_checked() {
+                    return encode_error(
+                        id,
+                        "pane_identity_reconcile_uncertain",
+                        format!(
+                            "converged identity snapshot could not be persisted before its receipt: {err}"
+                        ),
+                    );
+                }
+                return match journal.complete(&params, receipt.clone()) {
+                    Ok(()) => encode_success(id, ResponseResult::PaneIdentityReconcile { receipt }),
+                    Err(err) => encode_error(
+                        id,
+                        "pane_identity_reconcile_uncertain",
+                        format!("converged identity receipt could not be persisted: {err}"),
+                    ),
+                };
+            }
+        }
+        if actual_target_label != params.target.expected_workspace_label {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "workspace_label_mismatch",
+                "target workspace label no longer matches",
+            );
+        }
+
+        let Some((source_ws_idx, source_pane_id)) = self.parse_pane_id(&params.expected.pane_id)
+        else {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "stale_source_identity",
+                "expected source pane was not found",
+            );
+        };
+        let Some(actual_source) = self.pane_identity(source_ws_idx, source_pane_id) else {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "stale_source_identity",
+                "expected source pane identity is unavailable",
+            );
+        };
+        if actual_source != params.expected {
+            return reject_identity_reconcile(
+                id,
+                &mut journal,
+                &params,
+                "stale_source_identity",
+                "source pane identity no longer matches",
+            );
+        }
+        let previous = actual_source;
+        let mut move_event = None;
+        if source_ws_idx == target_ws_idx {
+            let Some(pane) = self.state.workspaces[source_ws_idx].pane_state_mut(source_pane_id)
+            else {
+                return reject_identity_reconcile(
+                    id,
+                    &mut journal,
+                    &params,
+                    "stale_source_identity",
+                    "source pane disappeared before mutation",
+                );
+            };
+            pane.token = requested_token;
+        } else {
+            let Some(source_tab_idx) =
+                self.state.workspaces[source_ws_idx].find_tab_index_for_pane(source_pane_id)
+            else {
+                return reject_identity_reconcile(
+                    id,
+                    &mut journal,
+                    &params,
+                    "stale_source_identity",
+                    "source pane tab disappeared before mutation",
+                );
+            };
+            if self.state.workspaces[source_ws_idx].tabs[source_tab_idx].zoomed {
+                return reject_identity_reconcile(
+                    id,
+                    &mut journal,
+                    &params,
+                    "pane_identity_busy",
+                    "source pane cannot migrate while its tab is zoomed",
+                );
+            }
+            let previous_tab_id = self.public_tab_id(source_ws_idx, source_tab_idx);
+            let Some(mut taken) =
+                self.state.workspaces[source_ws_idx].take_pane_for_move(source_pane_id)
+            else {
+                return reject_identity_reconcile(
+                    id,
+                    &mut journal,
+                    &params,
+                    "pane_identity_reconcile_failed",
+                    "source pane could not be moved",
+                );
+            };
+            taken.moved.pane_state.token = requested_token;
+            let closed_tab_id = taken.removed_tab_idx.and_then(|_| previous_tab_id.clone());
+            self.state.workspaces[source_ws_idx].unregister_moved_pane(source_pane_id);
+            self.state
+                .public_pane_id_aliases
+                .insert(previous.pane_id.clone(), source_pane_id);
+            let source_workspace_empty = taken.workspace_empty;
+            if source_workspace_empty {
+                self.state.workspaces.remove(source_ws_idx);
+                if self.state.workspaces.is_empty() {
+                    self.state.active = None;
+                    self.state.selected = 0;
+                } else {
+                    if let Some(active) = self.state.active {
+                        self.state.active = Some(if active == source_ws_idx {
+                            source_ws_idx.min(self.state.workspaces.len() - 1)
+                        } else if active > source_ws_idx {
+                            active - 1
+                        } else {
+                            active
+                        });
+                    }
+                    if self.state.selected == source_ws_idx {
+                        self.state.selected = source_ws_idx.min(self.state.workspaces.len() - 1);
+                    } else if self.state.selected > source_ws_idx {
+                        self.state.selected -= 1;
+                    }
+                }
+            }
+            let Some(target_ws_idx) = self.parse_workspace_id(&params.target.workspace_id) else {
+                return encode_error(
+                    id,
+                    "pane_identity_reconcile_uncertain",
+                    "target workspace disappeared during identity mutation",
+                );
+            };
+            let target_tab_idx = self.state.workspaces[target_ws_idx]
+                .create_tab_from_existing_pane(
+                    taken.moved,
+                    None,
+                    self.event_tx.clone(),
+                    self.render_notify.clone(),
+                    self.render_dirty.clone(),
+                );
+            self.state.remove_alias_shadowed_by_new_pane(source_pane_id);
+            if let Some(tab) = self.tab_info(target_ws_idx, target_tab_idx) {
+                move_event = Some((
+                    previous_tab_id.unwrap_or_default(),
+                    tab,
+                    source_workspace_empty.then(|| previous.workspace_id.clone()),
+                    closed_tab_id,
+                ));
+            }
+        }
+
+        let Some((current_ws_idx, current_pane_id)) =
+            self.find_pane_by_terminal_id(&params.expected.terminal_id)
+        else {
+            return encode_error(
+                id,
+                "pane_identity_reconcile_uncertain",
+                "migrated pane identity could not be recovered",
+            );
+        };
+        let Some(current) = self.pane_identity(current_ws_idx, current_pane_id) else {
+            return encode_error(
+                id,
+                "pane_identity_reconcile_uncertain",
+                "migrated pane identity could not be described",
+            );
+        };
+        self.state.mark_session_dirty();
+        if let Err(err) = self.save_session_now_checked() {
+            return encode_error(
+                id,
+                "pane_identity_reconcile_uncertain",
+                format!("identity changed but the session snapshot could not be persisted: {err}"),
+            );
+        }
+        let receipt = PaneIdentityReconcileReceipt {
+            operation_id: params.operation_id.clone(),
+            disposition: PaneIdentityReconcileDisposition::Applied,
+            previous,
+            current: current.clone(),
+        };
+        if let Err(err) = journal.complete(&params, receipt.clone()) {
+            return encode_error(
+                id,
+                "pane_identity_reconcile_uncertain",
+                format!("identity changed but receipt could not be persisted: {err}"),
+            );
+        }
+        if let Some((previous_tab_id, created_tab, closed_workspace_id, closed_tab_id)) = move_event
+        {
+            if let Some(closed_tab_id) = closed_tab_id.as_ref() {
+                self.emit_event(EventEnvelope {
+                    event: EventKind::TabClosed,
+                    data: EventData::TabClosed {
+                        tab_id: closed_tab_id.clone(),
+                        workspace_id: receipt.previous.workspace_id.clone(),
+                    },
+                });
+            }
+            if let Some(closed_workspace_id) = closed_workspace_id.as_ref() {
+                self.emit_event(EventEnvelope {
+                    event: EventKind::WorkspaceClosed,
+                    data: EventData::WorkspaceClosed {
+                        workspace_id: closed_workspace_id.clone(),
+                        workspace: None,
+                    },
+                });
+            }
+            self.emit_event(EventEnvelope {
+                event: EventKind::TabCreated,
+                data: EventData::TabCreated {
+                    tab: created_tab.clone(),
+                },
+            });
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneMoved,
+                data: EventData::PaneMoved {
+                    previous_pane_id: receipt.previous.pane_id.clone(),
+                    previous_workspace_id: receipt.previous.workspace_id.clone(),
+                    previous_tab_id: previous_tab_id.clone(),
+                    pane: Box::new(self.pane_info(current_ws_idx, current_pane_id).unwrap()),
+                    created_workspace: None,
+                    created_tab: Some(created_tab.clone()),
+                    closed_workspace_id,
+                    closed_tab_id,
+                },
+            });
+            if let Some((source_ws_idx, source_tab_idx)) = self.parse_tab_id(&previous_tab_id) {
+                self.emit_layout_updated_event(source_ws_idx, source_tab_idx);
+            }
+            if let Some((target_ws_idx, target_tab_idx)) = self.parse_tab_id(&created_tab.tab_id) {
+                self.emit_layout_updated_event(target_ws_idx, target_tab_idx);
+            }
+        }
+        encode_success(id, ResponseResult::PaneIdentityReconcile { receipt })
+    }
+
+    fn find_pane_by_terminal_id(&self, terminal_id: &str) -> Option<(usize, PaneId)> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(&pane_id, pane)| {
+                        (pane.attached_terminal_id.to_string() == terminal_id)
+                            .then_some((ws_idx, pane_id))
+                    })
+                })
+            })
+    }
+
+    fn pane_identity(&self, ws_idx: usize, pane_id: PaneId) -> Option<PaneIdentity> {
+        let pane = self.pane_info(ws_idx, pane_id)?;
+        Some(PaneIdentity {
+            pane_id: pane.pane_id,
+            terminal_id: pane.terminal_id,
+            workspace_id: pane.workspace_id,
+            token: pane.token?,
+        })
+    }
+
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
@@ -2082,6 +2504,31 @@ fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
 }
 
+fn valid_identity_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+}
+
+fn reject_identity_reconcile(
+    id: String,
+    journal: &mut crate::pane_identity_journal::PaneIdentityJournal,
+    request: &PaneIdentityReconcileV1Params,
+    code: &str,
+    message: &str,
+) -> String {
+    match journal.reject(request, code, message) {
+        Ok(()) => encode_error(id, code, message),
+        Err(err) => encode_error(
+            id,
+            "pane_identity_reconcile_uncertain",
+            format!("identity rejection could not be persisted: {err}"),
+        ),
+    }
+}
+
 impl App {
     fn resolve_optional_pane(&self, pane_id: Option<&str>) -> Option<(usize, PaneId)> {
         match pane_id {
@@ -3035,6 +3482,241 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn pane_identity_reconcile_params(
+        app: &App,
+        source_ws_idx: usize,
+        source_pane_id: PaneId,
+        target_ws_idx: usize,
+        operation_id: &str,
+    ) -> PaneIdentityReconcileV1Params {
+        let source = app.pane_info(source_ws_idx, source_pane_id).unwrap();
+        PaneIdentityReconcileV1Params {
+            operation_id: operation_id.into(),
+            expected: crate::api::schema::PaneIdentity {
+                pane_id: source.pane_id,
+                terminal_id: source.terminal_id,
+                workspace_id: source.workspace_id,
+                token: source.token.unwrap(),
+            },
+            target: crate::api::schema::PaneIdentityReconcileTarget {
+                workspace_id: app.public_workspace_id(target_ws_idx),
+                expected_workspace_label: "herdr".into(),
+                token: "orch".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn pane_identity_reconcile_retokens_in_place_without_replacing_the_terminal() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.workspaces[0].custom_name = Some("herdr".into());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let params = pane_identity_reconcile_params(&app, 0, pane_id, 0, "identity-1");
+        let previous = params.expected.clone();
+
+        let response = app.handle_pane_identity_reconcile_v1("req".into(), params);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneIdentityReconcile { receipt } = success.result else {
+            panic!("expected pane identity reconciliation receipt");
+        };
+        assert_eq!(
+            receipt.disposition,
+            crate::api::schema::PaneIdentityReconcileDisposition::Applied
+        );
+        assert_eq!(receipt.previous, previous);
+        assert_eq!(receipt.current.pane_id, receipt.previous.pane_id);
+        assert_eq!(receipt.current.terminal_id, receipt.previous.terminal_id);
+        assert_eq!(receipt.current.workspace_id, receipt.previous.workspace_id);
+        assert_eq!(receipt.current.token, "orch");
+    }
+
+    #[test]
+    fn pane_identity_reconcile_moves_the_same_pane_and_terminal_across_workspaces() {
+        let mut app = app_with_linked_worktree();
+        app.state.workspaces.push(Workspace::test_new("herdr"));
+        seed_terminal_states(&mut app);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let params = pane_identity_reconcile_params(&app, 0, pane_id, 1, "identity-2");
+        let previous = params.expected.clone();
+
+        let response = app.handle_pane_identity_reconcile_v1("req".into(), params);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneIdentityReconcile { receipt } = success.result else {
+            panic!("expected pane identity reconciliation receipt");
+        };
+        assert_eq!(
+            receipt.disposition,
+            crate::api::schema::PaneIdentityReconcileDisposition::Applied
+        );
+        assert_eq!(receipt.previous, previous);
+        assert_ne!(receipt.current.pane_id, receipt.previous.pane_id);
+        assert_eq!(receipt.current.terminal_id, receipt.previous.terminal_id);
+        assert_eq!(receipt.current.workspace_id, app.public_workspace_id(0));
+        assert_eq!(receipt.current.token, "orch");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].custom_name.as_deref(),
+            Some("herdr")
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(
+            app.state.workspaces[0].tabs[1]
+                .terminal_id(pane_id)
+                .map(ToString::to_string),
+            Some(receipt.current.terminal_id)
+        );
+    }
+
+    #[test]
+    fn pane_identity_reconcile_rejects_collision_stale_source_and_target_rename_without_mutation() {
+        for failure in ["collision", "stale_source", "target_rename"] {
+            let mut app = app_with_linked_worktree();
+            app.state.workspaces.push(Workspace::test_new("herdr"));
+            seed_terminal_states(&mut app);
+            let source_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let mut params = pane_identity_reconcile_params(
+                &app,
+                0,
+                source_pane_id,
+                1,
+                &format!("identity-{failure}"),
+            );
+            match failure {
+                "collision" => {
+                    let target_pane_id = app.state.workspaces[1].tabs[0].root_pane;
+                    app.state.workspaces[1]
+                        .pane_state_mut(target_pane_id)
+                        .unwrap()
+                        .token = crate::pane::PaneToken::parse("orch").unwrap();
+                }
+                "stale_source" => params.expected.terminal_id = "term_stale".into(),
+                "target_rename" => app.state.workspaces[1].custom_name = Some("renamed".into()),
+                _ => unreachable!(),
+            }
+            let original_workspace_count = app.state.workspaces.len();
+            let original_source = app.pane_identity(0, source_pane_id).unwrap();
+
+            let response = app.handle_pane_identity_reconcile_v1("req".into(), params);
+
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            let expected_code = match failure {
+                "collision" => "pane_token_conflict",
+                "stale_source" => "stale_source_identity",
+                "target_rename" => "workspace_label_mismatch",
+                _ => unreachable!(),
+            };
+            assert_eq!(error.error.code, expected_code);
+            assert_eq!(app.state.workspaces.len(), original_workspace_count);
+            assert_eq!(
+                app.pane_identity(0, source_pane_id).unwrap(),
+                original_source
+            );
+        }
+    }
+
+    #[test]
+    fn pane_identity_reconcile_replays_the_receipt_and_rejects_operation_id_reuse() {
+        let mut app = app_with_linked_worktree();
+        app.state.workspaces.push(Workspace::test_new("herdr"));
+        seed_terminal_states(&mut app);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let params = pane_identity_reconcile_params(&app, 0, pane_id, 1, "identity-replay");
+
+        let first = app.handle_pane_identity_reconcile_v1("first".into(), params.clone());
+        let first: SuccessResponse = serde_json::from_str(&first).unwrap();
+        let ResponseResult::PaneIdentityReconcile {
+            receipt: first_receipt,
+        } = first.result
+        else {
+            panic!("expected pane identity reconciliation receipt");
+        };
+        let tab_count = app.state.workspaces[0].tabs.len();
+
+        let replay = app.handle_pane_identity_reconcile_v1("replay".into(), params.clone());
+        let replay: SuccessResponse = serde_json::from_str(&replay).unwrap();
+        let ResponseResult::PaneIdentityReconcile { receipt } = replay.result else {
+            panic!("expected replayed pane identity reconciliation receipt");
+        };
+        assert_eq!(receipt, first_receipt);
+        assert_eq!(app.state.workspaces[0].tabs.len(), tab_count);
+
+        let mut mismatched = params;
+        mismatched.target.token = "or01".into();
+        let response = app.handle_pane_identity_reconcile_v1("conflict".into(), mismatched);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "operation_id_reused");
+        assert_eq!(app.state.workspaces[0].tabs.len(), tab_count);
+        assert_eq!(first_receipt.current.token, "orch");
+    }
+
+    #[test]
+    fn pane_identity_reconcile_reports_an_already_converged_noop() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.workspaces[0].custom_name = Some("herdr".into());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .token = crate::pane::PaneToken::parse("orch").unwrap();
+        let params = pane_identity_reconcile_params(&app, 0, pane_id, 0, "identity-noop");
+
+        let response = app.handle_pane_identity_reconcile_v1("req".into(), params);
+
+        let success: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|err| panic!("invalid success response {response}: {err}"));
+        let ResponseResult::PaneIdentityReconcile { receipt } = success.result else {
+            panic!("expected pane identity reconciliation receipt");
+        };
+        assert_eq!(
+            receipt.disposition,
+            crate::api::schema::PaneIdentityReconcileDisposition::AlreadyConverged
+        );
+        assert_eq!(receipt.previous, receipt.current);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn pane_identity_reconcile_recovers_a_pending_operation_from_converged_state() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.workspaces[0].custom_name = Some("herdr".into());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let params = pane_identity_reconcile_params(&app, 0, pane_id, 0, "identity-pending");
+        let mut journal = crate::pane_identity_journal::PaneIdentityJournal::open(
+            app.pane_identity_journal_path.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            journal.begin(&params).unwrap(),
+            crate::pane_identity_journal::OperationState::New
+        );
+        drop(journal);
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .token = crate::pane::PaneToken::parse("orch").unwrap();
+
+        let response = app.handle_pane_identity_reconcile_v1("req".into(), params.clone());
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneIdentityReconcile { receipt } = success.result else {
+            panic!("expected pane identity reconciliation receipt");
+        };
+        assert_eq!(
+            receipt.disposition,
+            crate::api::schema::PaneIdentityReconcileDisposition::Applied
+        );
+        assert_eq!(receipt.current.token, "orch");
+        let replay = app.handle_pane_identity_reconcile_v1("replay".into(), params);
+        let replay: SuccessResponse = serde_json::from_str(&replay).unwrap();
+        assert!(matches!(
+            replay.result,
+            ResponseResult::PaneIdentityReconcile { receipt: replayed } if replayed == receipt
+        ));
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     }
 
     #[test]

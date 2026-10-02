@@ -42,4 +42,7 @@ pub struct ServerCapabilities {
     /// Whether this server supports exact native Pane tokens during tab creation.
     #[serde(default)]
     pub tab_create_v2: bool,
+    /// Whether this server supports idempotent in-place Pane identity reconciliation.
+    #[serde(default)]
+    pub pane_identity_reconcile_v1: bool,
 }

@@ -79,6 +79,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         agent_session_rotation_v1: cfg!(unix),
         tab_create_v2: true,
+        pane_identity_reconcile_v1: true,
     })
 }
 
@@ -822,6 +823,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
         Method::PaneMove(_) => "pane.move",
+        Method::PaneIdentityReconcileV1(_) => "pane.identity_reconcile.v1",
         Method::PaneZoom(_) => "pane.zoom",
         Method::PaneLayout(_) => "pane.layout",
         Method::PaneProcessInfo(_) => "pane.process_info",
@@ -1665,6 +1667,7 @@ mod tests {
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
+                pane_identity_reconcile_v1: true,
             }),
             None,
             None,

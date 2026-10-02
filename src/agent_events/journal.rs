@@ -62,8 +62,10 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS source_panes (source TEXT PRIMARY KEY, pane_id TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS session_native_state (source TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(source,kind));
             CREATE TABLE IF NOT EXISTS pending_submissions (submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL, text_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','consumed')), created INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
-            PRAGMA user_version=1;")?;
+            CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);")?;
+        if version == 0 {
+            db.execute_batch("PRAGMA user_version=1;")?;
+        }
         if version < JOURNAL_VERSION {
             db.execute_batch(
                 "BEGIN IMMEDIATE;
@@ -1435,6 +1437,78 @@ mod tests {
             SubmissionPrepareResult::Duplicate
         );
         drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn terminal_submission_receipts_survive_two_consecutive_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-terminal-receipts-two-reopens-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        for (submission_id, state) in [
+            ("accepted-receipt", AgentEventsSubmissionState::Accepted),
+            ("rejected-receipt", AgentEventsSubmissionState::Rejected),
+        ] {
+            assert_eq!(
+                journal
+                    .prepare_submission(
+                        submission_id,
+                        "term",
+                        TranscriptKind::Traex,
+                        "session",
+                        submission_id,
+                    )
+                    .unwrap(),
+                SubmissionPrepareResult::Prepared
+            );
+            assert_eq!(
+                journal
+                    .settle_submission(submission_id, state)
+                    .unwrap()
+                    .0
+                    .state,
+                state
+            );
+        }
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .submission_receipt("accepted-receipt")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Accepted
+        );
+        assert_eq!(
+            reopened
+                .submission_receipt("rejected-receipt")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Rejected
+        );
+        drop(reopened);
+
+        let reopened_again = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened_again
+                .submission_receipt("accepted-receipt")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Accepted
+        );
+        assert_eq!(
+            reopened_again
+                .submission_receipt("rejected-receipt")
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Rejected
+        );
+        drop(reopened_again);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }

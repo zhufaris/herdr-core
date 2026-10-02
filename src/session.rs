@@ -22,6 +22,8 @@ pub struct SessionInfo {
     pub name: String,
     pub default: bool,
     pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_error: Option<String>,
     pub socket_path: String,
     pub session_dir: String,
 }
@@ -216,10 +218,17 @@ pub fn session_info(name: Option<&str>) -> SessionInfo {
     let display_name = name.unwrap_or(DEFAULT_SESSION_NAME).to_string();
     let socket_path = api_socket_path_for(name);
     let session_dir = data_dir_for(name);
+    let connection = crate::ipc::connect_local_stream(&socket_path);
+    let running = connection.is_ok();
+    let connection_error = connection
+        .err()
+        .filter(|error| !crate::cli::server_not_running_error(error))
+        .map(|error| error.to_string());
     SessionInfo {
         name: display_name,
         default,
-        running: is_running_at(&socket_path),
+        running,
+        connection_error,
         socket_path: socket_path.display().to_string(),
         session_dir: session_dir.display().to_string(),
     }
@@ -301,17 +310,44 @@ pub fn delete_session(name: &str) -> Result<SessionInfo, String> {
         return Err("deleting the default session is not supported".to_string());
     }
     validate_name(name)?;
-    let socket_path = api_socket_path_for(Some(name));
+    let Some(dir) = exact_session_dir_for_delete(name)? else {
+        return Ok(session_info(Some(name)));
+    };
+    let socket_path = dir.join("herdr.sock");
     if is_running_at(&socket_path) {
         return Err(format!(
             "session {name} is running; stop it before deleting"
         ));
     }
     let info = session_info(Some(name));
-    let dir = data_dir_for(Some(name));
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(info),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(info),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn exact_session_dir_for_delete(name: &str) -> Result<Option<PathBuf>, String> {
+    let sessions_dir = crate::config::config_dir().join("sessions");
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return Ok(Some(entry.path()));
+        }
+    }
+
+    // A path lookup alone can resolve a different spelling on case-insensitive
+    // filesystems. Never probe its socket or delete it without an exact entry.
+    match std::fs::symlink_metadata(sessions_dir.join(name)) {
+        Ok(_) => Err(format!(
+            "session {name} does not match an exact session name; use the spelling shown by `herdr session list`"
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -469,11 +505,78 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::config::test_config_env_lock()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_discovery_distinguishes_denied_running_and_stopped_servers() {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        use widestring::U16CString;
+
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-session-denied-{}", std::process::id()));
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        let denied_path = api_socket_path_for(Some("denied"));
+        let running_path = api_socket_path_for(Some("running"));
+        std::fs::create_dir_all(denied_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(running_path.parent().unwrap()).unwrap();
+
+        // A SYSTEM-only pipe reproduces access denial without requiring elevation in CI.
+        let sddl = U16CString::from_str("D:P(A;;GA;;;SY)").unwrap();
+        let denied_listener = ListenerOptions::new()
+            .name(
+                denied_path
+                    .to_string_lossy()
+                    .to_ns_name::<GenericNamespaced>()
+                    .unwrap(),
+            )
+            .security_descriptor(SecurityDescriptor::deserialize(&sddl).unwrap())
+            .create_sync()
+            .unwrap();
+        let running_listener = crate::ipc::bind_local_listener(&running_path).unwrap();
+        let error = crate::ipc::connect_local_stream(&denied_path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("admin shell"));
+
+        let sessions = list_sessions().unwrap();
+        let denied = sessions
+            .iter()
+            .find(|session| session.name == "denied")
+            .unwrap();
+        assert!(!denied.running);
+        assert!(denied.connection_error.is_some());
+        let running = sessions
+            .iter()
+            .find(|session| session.name == "running")
+            .unwrap();
+        assert!(running.running);
+        assert!(running.connection_error.is_none());
+        let stopped = sessions.iter().find(|session| session.default).unwrap();
+        assert!(!stopped.running);
+        assert!(stopped.connection_error.is_none());
+        for session in [running, stopped] {
+            assert!(serde_json::to_value(session)
+                .unwrap()
+                .get("connection_error")
+                .is_none());
+        }
+        assert!(serde_json::to_value(denied).unwrap()["connection_error"].is_string());
+
+        drop(denied_listener);
+        drop(running_listener);
+        match previous_config_home {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(config_home).unwrap();
     }
 
     #[cfg(unix)]

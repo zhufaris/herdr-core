@@ -90,12 +90,26 @@ pub(super) fn render_collapsed(
                     palette.overlay0
                 }),
             );
+            let mut status_badge = Rect::default();
             if !endpoint.endpoint_id.is_local() {
                 let (glyph, _, color) = endpoint_status_presentation(endpoint.status, palette);
-                put_right_text(buffer, rect, rect.y, glyph, Style::default().fg(color));
+                let width = display_width(glyph).min(rect.width);
+                status_badge = Rect::new(rect.right().saturating_sub(width), rect.y, width, 1);
+                put_right_text(
+                    buffer,
+                    rect,
+                    rect.y,
+                    glyph,
+                    state.machine_diagnostics.badge_style(
+                        endpoint,
+                        palette,
+                        Style::default().fg(color),
+                    ),
+                );
             }
             hits.machines.push(MachineHit {
                 rect,
+                status_badge,
                 collapse_toggle: Rect::new(rect.x, rect.y, u16::from(rect.width > 1), 1),
                 endpoint_id: endpoint.endpoint_id.clone(),
             });
@@ -128,7 +142,13 @@ pub(super) fn render_collapsed(
             if selected {
                 buffer.set_style(rect, Style::default().bg(selection_background));
             } else if focused {
-                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+                buffer.set_style(
+                    rect,
+                    Style::default().bg(super::sidebar::workspace_active_background(
+                        palette,
+                        state.selected_workspace_id.is_some(),
+                    )),
+                );
             }
             let stale = endpoint.status != ClientEndpointStatus::Online;
             let number = format!(" {}", workspace.number);
@@ -314,8 +334,23 @@ pub(super) fn render_expanded(
             }
         })
         .collect::<Vec<_>>();
-    let gaps = vec![0; rows.len()];
-    if std::mem::take(state.reveal_navigation_workspace) {
+    let gaps = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| match (row, rows.get(index + 1)) {
+            (
+                Row::Workspace { endpoint, .. },
+                Some(Row::Workspace {
+                    endpoint: next_endpoint,
+                    entry,
+                }),
+            ) if endpoint == next_endpoint => u16::from(!entry.indented) * config.spaces.row_gap,
+            _ => 0,
+        })
+        .collect::<Vec<_>>();
+    let reveal_navigation = !body.is_empty() && std::mem::take(state.reveal_navigation_workspace);
+    let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
+    if reveal_navigation || reveal_focus {
         let selected_row = rows.iter().position(|row| match row {
             Row::Workspace { endpoint, entry } => {
                 let endpoint = &state.endpoints[*endpoint];
@@ -324,9 +359,17 @@ pub(super) fn render_expanded(
                     .as_deref()
                     .and_then(|snapshot| snapshot.workspaces.get(entry.index))
                     .is_some_and(|workspace| {
-                        state.selected_workspace_id.is_some_and(|target| {
-                            target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
-                        })
+                        if reveal_navigation {
+                            state.selected_workspace_id.is_some_and(|target| {
+                                target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
+                            })
+                        } else {
+                            &endpoint.endpoint_id == state.active_endpoint_id
+                                && active_snapshot.is_some_and(|snapshot| {
+                                    snapshot.focused_workspace_id.as_deref()
+                                        == Some(workspace.workspace_id.as_str())
+                                })
+                        }
                     })
             }
             Row::Endpoint(_) => false,
@@ -355,7 +398,7 @@ pub(super) fn render_expanded(
     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
     let mut y = body.y;
-    for row in rows.iter().skip(*state.workspace_scroll) {
+    for (row_index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
         match row {
             Row::Endpoint(index) => {
                 if y >= body.bottom() {
@@ -365,16 +408,18 @@ pub(super) fn render_expanded(
                 let rect = Rect::new(body.x, y, content_width, 1);
                 let collapsed = state.collapsed_endpoints.contains(&endpoint.endpoint_id);
                 let marker = if collapsed { "▸" } else { "▾" };
-                render_endpoint_row(
+                let status_badge = render_endpoint_row(
                     buffer,
                     rect,
                     marker,
                     endpoint,
                     collapsed && &endpoint.endpoint_id == state.active_endpoint_id,
+                    state.machine_diagnostics,
                     palette,
                 );
                 hits.machines.push(MachineHit {
                     rect,
+                    status_badge,
                     collapse_toggle: Rect::new(
                         rect.x.saturating_add(1),
                         rect.y,
@@ -383,7 +428,9 @@ pub(super) fn render_expanded(
                     ),
                     endpoint_id: endpoint.endpoint_id.clone(),
                 });
-                y = y.saturating_add(1);
+                y = y
+                    .saturating_add(1)
+                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
             }
             Row::Workspace { endpoint, entry } => {
                 let endpoint = &state.endpoints[*endpoint];
@@ -424,19 +471,16 @@ pub(super) fn render_expanded(
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
-                    workspace,
                     status,
                     config.status_indicators,
                     entry,
                     tokens,
-                    endpoint_active,
+                    endpoint_active && workspace.focused,
                     selected,
+                    state.selected_workspace_id.is_some(),
                     false,
                     palette,
                 );
-                if selected && palette.selection_bg == ratatui::style::Color::Reset {
-                    buffer.set_style(nested, Style::default().bg(palette.active_row_bg));
-                }
                 if endpoint.status != ClientEndpointStatus::Online {
                     buffer.set_style(
                         rect,
@@ -460,7 +504,9 @@ pub(super) fn render_expanded(
                     indented: entry.indented,
                     group_toggle,
                 });
-                y = y.saturating_add(height);
+                y = y
+                    .saturating_add(height)
+                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
             }
         }
     }
@@ -547,8 +593,9 @@ fn render_endpoint_row(
     marker: &str,
     endpoint: &ClientShellEndpoint,
     highlighted: bool,
+    auth: &super::machine_diagnostics::MachineDiagnostics,
     palette: &Palette,
-) {
+) -> Rect {
     if highlighted {
         buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
     }
@@ -558,7 +605,11 @@ fn render_endpoint_row(
     } else {
         state
     };
-    let signal = if endpoint.endpoint_id.is_local() {
+    let signal = if auth.required_for(endpoint) {
+        "! auth".to_owned()
+    } else if endpoint.status == ClientEndpointStatus::Attention {
+        "! error".to_owned()
+    } else if endpoint.endpoint_id.is_local() {
         String::new()
     } else if state.is_empty() {
         glyph.to_owned()
@@ -582,5 +633,17 @@ fn render_endpoint_row(
             )
             .add_modifier(Modifier::BOLD),
     );
-    put_right_text(buffer, rect, rect.y, &signal, Style::default().fg(color));
+    put_right_text(
+        buffer,
+        rect,
+        rect.y,
+        &signal,
+        auth.badge_style(endpoint, palette, Style::default().fg(color)),
+    );
+    Rect::new(
+        rect.right().saturating_sub(signal_width),
+        rect.y,
+        signal_width,
+        1,
+    )
 }

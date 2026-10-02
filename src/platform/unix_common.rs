@@ -8,6 +8,123 @@ pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::C
     }
 }
 
+pub(crate) fn read_fd(fd: std::os::fd::RawFd, data: &mut [u8]) -> std::io::Result<usize> {
+    let result = unsafe { libc::read(fd, data.as_mut_ptr().cast(), data.len()) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result > 0)
+    }
+}
+
+pub(crate) fn shutdown_client_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    stream.inner().shutdown(std::net::Shutdown::Both)
+}
+
+pub(crate) struct ClientStreamReader<'a>(pub(crate) &'a mut crate::ipc::LocalStream);
+
+impl std::io::Read for ClientStreamReader<'_> {
+    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+
+        loop {
+            match self.0.read(data) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let crate::ipc::LocalStream::UdSocket(stream) = &*self.0;
+                    let mut descriptor = libc::pollfd {
+                        fd: stream.inner().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // Sleep until input or shutdown, without polling quiet observers.
+                    if unsafe { libc::poll(&mut descriptor, 1, -1) } < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+pub(crate) fn write_client_stream(
+    stream: &crate::ipc::LocalStream,
+    mut data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::{self, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::time::Instant;
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut socket = socket.inner();
+    let Some(timeout) = socket.write_timeout()? else {
+        return socket.write_all(data);
+    };
+    let timed_out = || {
+        // Dropping the writer clone alone would leave the reader blocked.
+        let _ = shutdown_client_stream(stream);
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "terminal observer stopped receiving output",
+        )
+    };
+    let mut progress = Instant::now();
+    while !data.is_empty() {
+        match socket.write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                data = &data[written..];
+                progress = Instant::now();
+                continue;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = timeout
+            .checked_sub(progress.elapsed())
+            .ok_or_else(timed_out)?;
+        let mut descriptor = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let wait_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut descriptor, 1, wait_ms) };
+        if ready == 0 {
+            return Err(timed_out());
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn wait_client_stream_readable(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
     use std::os::fd::{AsFd as _, AsRawFd as _};
     let crate::ipc::LocalStream::UdSocket(stream) = stream;
@@ -27,15 +144,33 @@ pub(crate) fn wait_client_stream_readable(stream: &crate::ipc::LocalStream) -> s
     Ok(())
 }
 
-pub(crate) fn forward_remote_bridge_stdio(stream: crate::ipc::LocalStream) -> std::io::Result<()> {
+pub(crate) fn forward_remote_bridge_stdio(
+    stream: crate::ipc::LocalStream,
+    idle_timeout: bool,
+) -> std::io::Result<()> {
+    forward_remote_bridge_stdio_with_timeout(
+        stream,
+        idle_timeout.then_some(super::remote_bridge::IDLE_TIMEOUT),
+    )
+}
+
+pub(super) fn forward_remote_bridge_stdio_with_timeout(
+    stream: crate::ipc::LocalStream,
+    idle_timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    use super::remote_bridge::{Activity, TrackedIo};
     use interprocess::TryClone as _;
 
-    let mut stdout = std::io::stdout().lock();
-    let mut socket_to_stdout = stream.try_clone()?;
+    let activity = idle_timeout.map(Activity::start).transpose()?;
+    let mut stdout = TrackedIo::new(std::io::stdout().lock(), activity.clone());
+    let mut socket_to_stdout = TrackedIo::new(stream.try_clone()?, activity.clone());
     let mut stdin_to_socket = stream;
     let _upload = std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        let mut stdin = TrackedIo::new(std::io::stdin(), activity.clone());
+        let _ = copy_flush(
+            &mut stdin,
+            &mut TrackedIo::new(&mut stdin_to_socket, activity),
+        );
         let crate::ipc::LocalStream::UdSocket(stream) = stdin_to_socket;
         let _ = stream.inner().shutdown(std::net::Shutdown::Write);
     });
@@ -361,5 +496,141 @@ mod tests {
     fn remote_ssh_config_dir_rejects_overlong_control_socket_name() {
         let err = create_remote_ssh_config_dir(&"x".repeat(200)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+/// Shared OpenSSH sockets outlive individual helpers. Never adopt a directory
+/// belonging to another uid, a symlink, or a directory accessible by others.
+pub(crate) fn shared_ssh_control_path(namespace: &Path, target: &str) -> std::io::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+
+    // Validate the resolved system temp directory, but retain the short /tmp
+    // spelling for sockets. On macOS /tmp resolves to /private/tmp; those extra
+    // bytes would consume the space OpenSSH needs for its staging suffix.
+    let base = Path::new("/tmp");
+    let resolved_base = std::fs::canonicalize(base)?;
+    let metadata = std::fs::symlink_metadata(&resolved_base)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o1000 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe SSH control directory parent",
+        ));
+    }
+    let dir = base.join(format!("hssh-{}", unsafe { libc::geteuid() }));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    validate_shared_ssh_dir(&dir)?;
+    let namespace = if namespace.is_absolute() {
+        namespace.to_owned()
+    } else {
+        std::env::current_dir()?.join(namespace)
+    };
+    let mut hash = Sha256::new();
+    hash.update(namespace.as_os_str().as_bytes());
+    hash.update([0]);
+    hash.update(target.as_bytes());
+    // %C additionally scopes the socket to OpenSSH's resolved destination,
+    // port and jump host, rather than merely the spelling of an alias.
+    // Keep 96 bits of namespace/target hash plus OpenSSH's 160-bit %C.
+    let hash = format!("{:x}", hash.finalize());
+    let path = dir.join(format!("{}-%C", &hash[..24]));
+    // OpenSSH first binds ControlPath + '.' + 16 random characters, then
+    // renames it. Reserve those 17 bytes, not just the final socket's length.
+    let expanded = path.to_string_lossy().replace("%C", &"0".repeat(40));
+    let staging = PathBuf::from(format!("{expanded}.{}", "0".repeat(16)));
+    if !fits_unix_socket_path(&staging) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SSH control socket staging path exceeds the Unix socket length limit",
+        ));
+    }
+    Ok(path)
+}
+
+fn validate_shared_ssh_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SSH control directory must be owned by the current user, mode 0700, and not a symlink",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod shared_ssh_tests {
+    use super::*;
+
+    #[test]
+    fn shared_ssh_control_path_is_stable_scoped_and_bounded() {
+        let path = shared_ssh_control_path(Path::new("/config/one"), "user@host").unwrap();
+        assert_eq!(
+            path,
+            shared_ssh_control_path(Path::new("/config/one"), "user@host").unwrap()
+        );
+        assert_ne!(
+            path,
+            shared_ssh_control_path(Path::new("/config/two"), "user@host").unwrap()
+        );
+        assert_ne!(
+            path,
+            shared_ssh_control_path(Path::new("/config/one"), "other@host").unwrap()
+        );
+        let expanded = path.to_string_lossy().replace("%C", &"f".repeat(40));
+        assert!(fits_unix_socket_path(&PathBuf::from(&expanded)));
+        // OpenSSH binds this temporary socket before renaming it to ControlPath.
+        assert!(fits_unix_socket_path(&PathBuf::from(format!(
+            "{expanded}.QuuYe7ZFE2HYeAE4"
+        ))));
+        validate_shared_ssh_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shared_ssh_staging_path_fits_with_maximum_uid_width() {
+        let path = shared_ssh_control_path(Path::new("/config/one"), "user@host").unwrap();
+        let directory = path.parent().unwrap();
+        let name = directory.file_name().unwrap().to_string_lossy();
+        let prefix = name.trim_end_matches(|ch: char| ch.is_ascii_digit());
+        let maximum_uid_directory = directory
+            .parent()
+            .unwrap()
+            .join(format!("{prefix}{}", u32::MAX));
+        let expanded = maximum_uid_directory
+            .join(path.file_name().unwrap())
+            .to_string_lossy()
+            .replace("%C", &"f".repeat(40));
+        assert!(fits_unix_socket_path(&PathBuf::from(format!(
+            "{expanded}.QuuYe7ZFE2HYeAE4"
+        ))));
+    }
+
+    #[test]
+    fn shared_ssh_directory_rejects_symlinks_and_public_modes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = create_remote_ssh_config_dir("ctl").unwrap();
+        let link = dir.join("link");
+        symlink(&dir, &link).unwrap();
+        assert_eq!(
+            validate_shared_ssh_dir(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_shared_ssh_dir(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

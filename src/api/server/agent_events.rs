@@ -956,6 +956,8 @@ mod tests {
             None,
             None,
             Some(service),
+            #[cfg(unix)]
+            None,
         )
         .unwrap();
 
@@ -1154,6 +1156,8 @@ mod tests {
                 None,
                 None,
                 Some(&subscriber_service),
+                #[cfg(unix)]
+                None,
             )
             .unwrap();
         });

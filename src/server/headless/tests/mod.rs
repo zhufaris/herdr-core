@@ -1,16 +1,58 @@
 use super::*;
 
+mod event_fairness;
+mod native_graphics;
+#[path = "pane_move.rs"]
+mod pane_move_tests;
 #[path = "pane_graphics.rs"]
-mod pane_graphics_tests;
+mod retained_graphics_tests;
+#[path = "surface_delta.rs"]
+mod surface_delta_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
+#[path = "surface_scroll.rs"]
+mod surface_scroll_tests;
 
-fn client_shell_snapshot(message: ServerMessage) -> Box<crate::protocol::ClientShellSnapshot> {
-    let ServerMessage::EndpointControl { kind, data } = message else {
-        panic!("expected client shell snapshot");
+fn client_shell_projection(
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> (
+    Box<protocol::ClientShellSnapshot>,
+    protocol::endpoint::EndpointAgentCompletions,
+) {
+    let read_control = |expected| {
+        let ServerMessage::EndpointControl { kind, data } = read_server_message(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("endpoint projection"),
+        ) else {
+            panic!("expected endpoint control {expected}");
+        };
+        assert_eq!(kind, expected);
+        data
     };
-    assert_eq!(kind, crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND);
-    Box::new(serde_json::from_str(&data).expect("decode client shell snapshot"))
+    let completions: protocol::endpoint::EndpointAgentCompletions =
+        serde_json::from_str(&read_control(protocol::endpoint::AGENT_COMPLETIONS_KIND)).unwrap();
+    let snapshot: Box<protocol::ClientShellSnapshot> =
+        serde_json::from_str(&read_control(protocol::endpoint::ENDPOINT_SNAPSHOT_KIND)).unwrap();
+    assert_eq!(completions.boot_id, snapshot.boot_id);
+    assert_eq!(completions.revision, snapshot.revision);
+    (snapshot, completions)
+}
+
+fn client_shell_snapshot(
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Box<protocol::ClientShellSnapshot> {
+    client_shell_projection(receiver).0
+}
+
+fn client_agent_view_projection(
+    message: ServerMessage,
+) -> crate::protocol::endpoint::EndpointAgentViewProjection {
+    let ServerMessage::EndpointControl { kind, data } = message else {
+        panic!("expected client agent view projection");
+    };
+    assert_eq!(kind, crate::protocol::endpoint::AGENT_VIEW_PROJECTION_KIND);
+    serde_json::from_str(&data).expect("decode client agent view projection")
 }
 
 fn test_headless_server() -> HeadlessServer {
@@ -64,6 +106,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_path: socket_path,
         client_socket_identity,
         clients: HashMap::new(),
+        native_graphics: Default::default(),
         #[cfg(unix)]
         next_client_id: 1,
         foreground_client_id: None,
@@ -82,6 +125,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         headless_size,
         effective_size: headless_size,
         shutting_down: false,
+        host_shutdown_requested: Arc::new(AtomicBool::new(false)),
         handoff_in_progress: false,
         #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
@@ -206,7 +250,6 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response: api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -264,7 +307,6 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
     let response = response_rx
@@ -576,6 +618,83 @@ fn a_newly_promoted_client_gets_the_window_title_again() {
     shutdown_test_runtimes(&mut server);
 }
 
+#[tokio::test]
+async fn promoted_client_window_title_uses_its_own_view() {
+    let mut server = test_headless_server();
+    let mut survivor = crate::workspace::Workspace::test_new("survivor");
+    let survivor_tab_index = survivor.test_add_tab(Some("survivor-tab"));
+    let survivor_pane = survivor.tabs[survivor_tab_index].layout.focused();
+    let disconnected = crate::workspace::Workspace::test_new("disconnected");
+    let disconnected_pane = disconnected.tabs[0].layout.focused();
+    server.app.state.workspaces = vec![survivor, disconnected];
+    server.app.state.active = Some(1);
+    server.app.state.selected = 1;
+    server.app.state.ensure_test_terminals();
+    let survivor_terminal = server.app.state.workspaces[0].tabs[survivor_tab_index]
+        .terminal_id(survivor_pane)
+        .expect("survivor terminal")
+        .clone();
+    let terminal = server
+        .app
+        .state
+        .terminals
+        .get_mut(&survivor_terminal)
+        .expect("survivor terminal state");
+    terminal.manual_label = Some("client-pane".into());
+    terminal.set_terminal_title(Some("CLIENT OSC".into()));
+    server
+        .app
+        .configure_window_title("{workspace}/{tab}/{pane}/{terminal_title}");
+
+    let (survivor_control, _) = connect_matching_test_shell(&mut server, 1);
+    let (disconnected_control, _) = connect_matching_test_shell(&mut server, 2);
+    let survivor_tab_id = server
+        .app
+        .public_tab_id(0, survivor_tab_index)
+        .expect("survivor tab id");
+    assert!(server.focus_shell_client_on_tab(1, &survivor_tab_id));
+    server.promote_client_to_foreground(2);
+    drain_window_titles(&survivor_control);
+    drain_window_titles(&disconnected_control);
+
+    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 2 }));
+    server.sync_window_title();
+
+    assert_eq!(
+        next_window_title(&survivor_control),
+        Some(Some("survivor/survivor-tab/client-pane/CLIENT OSC".into()))
+    );
+    assert_eq!(server.app.state.active, Some(1));
+    assert_eq!(
+        server.shell_tab_id_for_client(1).as_deref(),
+        Some(survivor_tab_id.as_str())
+    );
+
+    let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+    runtime.test_process_pty_bytes(b"\x1b]0;UPDATED OSC\x07");
+    server
+        .app
+        .terminal_runtimes
+        .insert(survivor_terminal, runtime);
+    assert!(
+        server
+            .sync_terminal_title_sources(&HashSet::from([survivor_pane]))
+            .1
+    );
+    assert_eq!(
+        next_window_title(&survivor_control),
+        Some(Some("survivor/survivor-tab/client-pane/UPDATED OSC".into()))
+    );
+    assert!(
+        !server
+            .sync_terminal_title_sources(&HashSet::from([disconnected_pane]))
+            .1
+    );
+    assert!(no_window_title(&survivor_control));
+
+    shutdown_test_runtimes(&mut server);
+}
+
 fn test_client_writer() -> (
     ClientWriter,
     std::sync::mpsc::Receiver<Vec<u8>>,
@@ -600,6 +719,9 @@ async fn client_shell_attach_seeds_workspace() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 6,
             surface_cols: 80,
             surface_rows: 23,
@@ -621,6 +743,65 @@ async fn client_shell_attach_seeds_workspace() {
 }
 
 #[tokio::test]
+async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("endpoint");
+    let pane_id = workspace.tabs[0].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    server.handle_server_event(ServerEvent::ClientShellConnected {
+        client_id: 78,
+        surface_cols: 80,
+        surface_rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        direct_graphics: false,
+        endpoint_keybindings: false,
+        mouse_capture: false,
+        surface_active: false,
+        surface_reuse: false,
+        surface_delta: false,
+        surface_scroll: false,
+        writer,
+    });
+    let (_, initial) = client_shell_projection(&control_rx);
+    assert!(initial.completions.is_empty());
+    for first_state in [
+        crate::detect::AgentState::Working,
+        crate::detect::AgentState::Unknown,
+    ] {
+        for state in [first_state, crate::detect::AgentState::Idle] {
+            server.app.state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state,
+                visible_blocker: false,
+                visible_working: state == crate::detect::AgentState::Working,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        }
+        server.render_and_stream();
+        let (snapshot, completions) = client_shell_projection(&control_rx);
+        assert_eq!(snapshot.agents.len(), 1);
+        let agent = &snapshot.agents[0];
+        let expected =
+            (first_state == crate::detect::AgentState::Working).then_some(agent.state_change_seq);
+        assert_eq!(
+            completions.completions.get(&agent.pane_id).copied(),
+            expected
+        );
+        assert_eq!(
+            server.app.session_snapshot().agents[0].completion_seq,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let mut server = test_headless_server();
     server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("endpoint")];
@@ -630,6 +811,9 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let client_id = 41;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols: 80,
             surface_rows: 23,
@@ -643,7 +827,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             writer,
         })
     );
-    let _initial_snapshot = control_rx.recv().expect("initial shell snapshot");
+    let _initial_snapshot = client_shell_snapshot(&control_rx);
     let boot_id = server.client_shell_boot_id.clone();
 
     assert!(
@@ -737,6 +921,89 @@ fn terminal_client_endpoint_request_error_removes_client() {
 }
 
 #[tokio::test]
+async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots() {
+    use crate::api::schema::{
+        AgentViewBuiltinField, AgentViewField, AgentViewFilter, AgentViewSetParams, AgentViewValue,
+    };
+
+    let mut server = test_headless_server();
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
+            client_id: 77,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: false,
+            writer,
+        })
+    );
+    let initial = client_shell_snapshot(&control_rx);
+
+    let mut view = AgentViewSetParams {
+        source: "example.views".into(),
+        label: Some("focus".into()),
+        filter: Some(AgentViewFilter::Eq {
+            field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
+            value: AgentViewValue::String("working".into()),
+        }),
+        sort: Vec::new(),
+    };
+    server.app.state.agent_view_override = Some(view.clone());
+    server.render_and_stream();
+    let set = client_agent_view_projection(read_server_message(
+        control_rx.recv().expect("set projection"),
+    ));
+    let set_snapshot = client_shell_snapshot(&control_rx);
+    assert!(set.revision > initial.revision);
+    assert_eq!(set.revision, set_snapshot.revision);
+    assert_eq!(
+        set.view.map(serde_json::from_value).transpose().unwrap(),
+        Some(view.clone())
+    );
+
+    view.filter = Some(AgentViewFilter::Eq {
+        field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
+        value: AgentViewValue::String("blocked".into()),
+    });
+    server.app.state.agent_view_override = Some(view.clone());
+    server.render_and_stream();
+    let replacement = client_agent_view_projection(read_server_message(
+        control_rx.recv().expect("replacement projection"),
+    ));
+    let replacement_snapshot = client_shell_snapshot(&control_rx);
+    assert!(replacement.revision > set.revision);
+    assert_eq!(replacement.revision, replacement_snapshot.revision);
+    assert_eq!(
+        replacement
+            .view
+            .map(serde_json::from_value)
+            .transpose()
+            .unwrap(),
+        Some(view)
+    );
+
+    server.app.state.agent_view_override = None;
+    server.render_and_stream();
+    let cleared = client_agent_view_projection(read_server_message(
+        control_rx.recv().expect("clear projection"),
+    ));
+    let cleared_snapshot = client_shell_snapshot(&control_rx);
+    assert!(cleared.revision > replacement.revision);
+    assert_eq!(cleared.revision, cleared_snapshot.revision);
+    assert!(cleared.view.is_none());
+    assert!(cleared_snapshot.agent_view_label.is_none());
+}
+
+#[tokio::test]
 async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("shell-only-label");
@@ -766,6 +1033,9 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -779,9 +1049,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             writer,
         })
     );
-    let snapshot = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("shell snapshot"),
-    ));
+    let snapshot = client_shell_snapshot(&control_rx);
     assert_eq!(snapshot.workspaces.len(), 1);
     assert_eq!(snapshot.workspaces[0].label, "shell-only-label");
     assert_eq!(
@@ -933,6 +1201,9 @@ fn connect_test_shell(
     let (writer, control, render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id,
             surface_cols,
             surface_rows,
@@ -1001,6 +1272,222 @@ fn recv_pane_surface_patch(
 }
 
 #[tokio::test]
+async fn unrelated_render_keeps_synchronized_pane_frame_committed() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let before = recv_pane_surface(&render, "baseline");
+    assert!(frame_text(&before.frame).contains("BASE"));
+    let projection_before = server.clients[&7].shell_projection_revision;
+
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[HPARTIAL",
+    );
+    server.app.state.workspaces[0].custom_name = Some("renamed during frame".into());
+    server.clients.get_mut(&7).unwrap().request_recompute();
+    server.render_and_stream();
+    assert!(render.try_recv().is_err(), "partial frame was published");
+    assert_eq!(
+        server.clients[&7].shell_projection_revision,
+        projection_before
+    );
+
+    write_shared_test_pane(&mut server, pane_id, b"\rCOMPLETE\x1b[?2026l");
+    assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    server.render_and_stream();
+    let after = recv_pane_surface(&render, "completed frame");
+    assert!(frame_text(&after.frame).contains("COMPLETE"));
+    assert!(after.projection_revision > projection_before);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn sibling_retained_output_waits_for_synchronized_pane_to_finish() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("synchronized-split");
+    let first = workspace.tabs[0].root_pane;
+    let second = workspace.test_split(ratatui::layout::Direction::Vertical);
+    workspace.insert_test_runtime(
+        first,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"FIRST"),
+    );
+    workspace.insert_test_runtime(
+        second,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"SECOND"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let _ = recv_pane_surface(&render, "split baseline");
+
+    write_shared_test_pane(&mut server, first, b"\x1b[?2026h\rPARTIAL");
+    write_shared_test_pane(&mut server, second, b"\rUPDATED");
+    assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([second])));
+    server.render_and_stream();
+    assert!(
+        render.try_recv().is_err(),
+        "sibling published partial frame"
+    );
+
+    write_shared_test_pane(&mut server, first, b"\rCOMPLETE\x1b[?2026l");
+    assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([first])));
+    server.render_and_stream();
+    let after = recv_pane_surface(&render, "completed split");
+    let text = frame_text(&after.frame);
+    assert!(
+        text.contains("COMPLETE") && text.contains("UPDATED"),
+        "{text}"
+    );
+    assert!(!text.contains("PARTIAL"));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn popup_synchronized_output_waits_for_complete_frame() {
+    let mut server = test_headless_server();
+    install_shared_view_test_runtime(&mut server);
+    let popup_runtime =
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 12, b"POPUP_BASE");
+    let (_, popup_id) = server.app.install_test_popup_runtime(popup_runtime);
+    server.popup_owner_tab_id = server.app.public_tab_id(0, 0);
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    assert!(recv_pane_surface(&render, "popup baseline").popup.is_some());
+
+    server
+        .app
+        .terminal_runtimes
+        .get(&popup_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?2026h\rPOPUP_PARTIAL");
+    server.render_and_stream();
+    assert!(render.try_recv().is_err(), "partial popup was published");
+
+    server
+        .app
+        .terminal_runtimes
+        .get(&popup_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\rPOPUP_COMPLETE\x1b[?2026l");
+    server.render_and_stream();
+    let after = recv_pane_surface(&render, "complete popup");
+    assert!(after
+        .popup
+        .as_ref()
+        .is_some_and(|popup| frame_text(&popup.frame).contains("POPUP_COMPLETE")));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn zoom_hidden_synchronized_pane_does_not_block_surface() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("zoomed-sync");
+    let hidden = workspace.tabs[0].root_pane;
+    let visible = workspace.test_split(ratatui::layout::Direction::Vertical);
+    workspace.tabs[0].zoomed = true;
+    workspace.insert_test_runtime(
+        hidden,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"HIDDEN"),
+    );
+    workspace.insert_test_runtime(
+        visible,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"VISIBLE"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    write_shared_test_pane(&mut server, hidden, b"\x1b[?2026h\rPARTIAL");
+    server.render_and_stream();
+    let surface = recv_pane_surface(&render, "zoomed visible pane");
+    assert!(frame_text(&surface.frame).contains("VISIBLE"));
+    assert!(!frame_text(&surface.frame).contains("PARTIAL"));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn retained_snapshot_survives_a_writer_waiting_for_the_terminal_core() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (control, render) = connect_matching_test_shell(&mut server, 7);
+    let _ = control.recv().expect("snapshot");
+    server.render_and_stream();
+    let _ = recv_pane_surface(&render, "initial surface");
+
+    let (release, writer, revision) = {
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\rAAAA\x1b[?1003h");
+        let revision = runtime.content_seq();
+        let (release, writer) =
+            runtime.test_contend_during_dirty_collection(b"\rBBBB\x1b[?1003l".to_vec());
+        (release, writer, revision)
+    };
+    let retained = server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id]));
+    release.send(()).expect("release waiting writer");
+    let announced = writer.join().expect("writer completed");
+
+    assert!(
+        retained,
+        "a waiting writer must not invalidate the collected snapshot"
+    );
+    assert!(
+        !announced,
+        "writer must wait before announcing a new revision"
+    );
+    let patch = recv_pane_surface_patch(&render, "snapshot before waiting write");
+    assert_eq!(patch.panes[0].content_revision, revision);
+    assert!(revision.is_multiple_of(2));
+    assert!(patch.panes[0].mouse_reporting);
+    let surface = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .expect("surface");
+    assert!(frame_text(&surface.frame).contains("AAAA"));
+    assert!(!frame_text(&surface.frame).contains("BBBB"));
+
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let next = recv_pane_surface_patch(&render, "waiting write remains dirty");
+    assert_eq!(next.panes[0].content_revision, revision + 2);
+    assert!(!next.panes[0].mouse_reporting);
+    let surface = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .expect("next surface");
+    assert!(frame_text(&surface.frame).contains("BBBB"));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn first_shell_surface_resizes_a_pane_that_entered_alternate_screen() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_test_shell(&mut server, 7, 80, 23);
+    let initial_size = server.app.state.workspaces[0].test_runtimes[&pane_id].current_size();
+
+    write_shared_test_pane(&mut server, pane_id, b"\x1b[?1049hALT");
+    server.render_and_stream();
+
+    let surface = recv_pane_surface(&render, "first alternate-screen surface");
+    assert!(surface.panes[0].alternate_screen_active);
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&pane_id].current_size(),
+        (initial_size.0, initial_size.1 + 1)
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_collection() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
@@ -1011,6 +1498,7 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
     server.render_and_stream();
     let large_initial = recv_pane_surface(&large_render, "large initial surface");
     let small_initial = recv_pane_surface(&small_render, "small initial surface");
+    let initial_size = server.app.state.workspaces[0].test_runtimes[&pane_id].current_size();
     assert_eq!(
         (large_initial.frame.width, large_initial.frame.height),
         (80, 23)
@@ -1079,6 +1567,10 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
     assert!(large_alt.panes[0].alternate_screen_active);
     assert!(small_alt.panes[0].alternate_screen_active);
     assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&pane_id].current_size(),
+        (initial_size.0, initial_size.1 + 1)
+    );
+    assert_eq!(
         large_alt.panes[0].inner_rect.width,
         large_initial.panes[0].inner_rect.width + 1
     );
@@ -1094,6 +1586,10 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
     let small_main = recv_pane_surface(&small_render, "small restored main-screen surface");
     assert!(!large_main.panes[0].alternate_screen_active);
     assert!(!small_main.panes[0].alternate_screen_active);
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&pane_id].current_size(),
+        initial_size
+    );
     assert_eq!(
         large_main.panes[0].inner_rect,
         large_initial.panes[0].inner_rect
@@ -1310,6 +1806,9 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (local_writer, local_control, _local_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 13,
             surface_cols: 80,
             surface_rows: 23,
@@ -1323,9 +1822,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             writer: local_writer,
         })
     );
-    let local_snapshot = client_shell_snapshot(read_server_message(
-        local_control.recv().expect("local shell snapshot"),
-    ));
+    let local_snapshot = client_shell_snapshot(&local_control);
     assert_eq!(
         local_snapshot.config_diagnostic.as_deref(),
         Some("theme warning")
@@ -1334,6 +1831,9 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 14,
             surface_cols: 80,
             surface_rows: 23,
@@ -1347,9 +1847,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             writer: endpoint_writer,
         })
     );
-    let endpoint_snapshot = client_shell_snapshot(read_server_message(
-        endpoint_control.recv().expect("endpoint shell snapshot"),
-    ));
+    let endpoint_snapshot = client_shell_snapshot(&endpoint_control);
     assert_eq!(
         endpoint_snapshot.config_diagnostic.as_deref(),
         Some("server keybinding warning\ntheme warning")
@@ -1380,12 +1878,8 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
 
     let (first_control, _first_render) = connect_test_shell(&mut server, 7, 100, 30);
     let (second_control, _second_render) = connect_test_shell(&mut server, 8, 80, 24);
-    let first_initial = client_shell_snapshot(read_server_message(
-        first_control.recv().expect("first snapshot"),
-    ));
-    let second_initial = client_shell_snapshot(read_server_message(
-        second_control.recv().expect("second snapshot"),
-    ));
+    let first_initial = client_shell_snapshot(&first_control);
+    let second_initial = client_shell_snapshot(&second_control);
     assert_eq!(
         first_initial.focused_tab_id.as_deref(),
         Some(first_tab_id.as_str())
@@ -1421,9 +1915,7 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
         first_control.try_recv().is_err(),
         "another shell must not receive a navigation replacement"
     );
-    let second_replacement = client_shell_snapshot(read_server_message(
-        second_control.recv().expect("second replacement snapshot"),
-    ));
+    let second_replacement = client_shell_snapshot(&second_control);
     assert_eq!(
         second_replacement.focused_tab_id.as_deref(),
         Some(second_tab_id.as_str())
@@ -1464,7 +1956,7 @@ async fn deferred_worktree_response_moves_only_its_source_client() {
         .get_mut(&51)
         .unwrap()
         .shell_deferred_navigation_response = Some(Vec::new());
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "id": "create-worktree",
         "result": {
             "type": "worktree_created",
@@ -1492,6 +1984,40 @@ async fn deferred_worktree_response_moves_only_its_source_client() {
         Some(original_tab_id.as_str())
     );
 
+    assert!(server.focus_shell_client_on_tab(51, &original_tab_id));
+    response["result"]["type"] = serde_json::json!("worktree_opened");
+    server
+        .clients
+        .get_mut(&51)
+        .unwrap()
+        .shell_endpoint_command_surface_revision = Some(source_surface_revision);
+    server
+        .clients
+        .get_mut(&51)
+        .unwrap()
+        .shell_endpoint_command_in_flight = true;
+    server
+        .clients
+        .get_mut(&51)
+        .unwrap()
+        .shell_deferred_navigation_response = Some(Vec::new());
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointResponseChunkReady {
+            client_id: 51,
+            boot_id: server.client_shell_boot_id.clone(),
+            request_id: "open-worktree".into(),
+            final_chunk: true,
+            data: serde_json::to_vec(&response).unwrap(),
+        })
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(51).as_deref(),
+        Some(created_tab_id.as_str())
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(52).as_deref(),
+        Some(original_tab_id.as_str())
+    );
     assert!(server.focus_shell_client_on_tab(51, &original_tab_id));
     // A source command begun in the old presentation epoch may finish after source-off and
     // source-on rollback. Its response remains endpoint-local, but it must not apply deferred
@@ -1585,7 +2111,6 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     );
     server.app.sync_focus_events();
@@ -1676,7 +2201,6 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
                 },
                 respond_to,
                 response_write_complete: None,
-                stream_active: None,
             },
         );
         let response = response_rx.recv().expect("navigation response");
@@ -1808,7 +2332,6 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         },
     ));
 
@@ -1853,7 +2376,6 @@ async fn public_close_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
 
@@ -2057,7 +2579,6 @@ async fn public_background_tab_create_preserves_client_locations() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert_eq!(
@@ -2105,7 +2626,6 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     let first_location = server.clients[&41].shell_location.as_ref().unwrap();
@@ -2155,13 +2675,11 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
     let second_tab_id = server.app.public_tab_id(1, 0).unwrap();
 
     let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23);
-    let _ = control_rx.recv().expect("initial snapshot");
+    let _ = client_shell_snapshot(&control_rx);
     assert!(server.focus_shell_client_on_tab(9, &second_tab_id));
     assert!(server.claim_shell_tab_geometry(9, false));
     server.render_and_stream();
-    let diverged = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("diverged snapshot"),
-    ));
+    let diverged = client_shell_snapshot(&control_rx);
     assert_eq!(
         diverged.focused_workspace_id.as_deref(),
         Some(server.app.public_workspace_id(1).as_str())
@@ -2188,7 +2706,6 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response: crate::api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().expect("agent focus response")).unwrap();
@@ -2206,9 +2723,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
     assert_eq!(location.focused_tab_id(), Some(first_tab_id.as_str()));
 
     server.render_and_stream();
-    let replacement = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("agent focus replacement snapshot"),
-    ));
+    let replacement = client_shell_snapshot(&control_rx);
     assert_eq!(
         replacement.focused_workspace_id.as_deref(),
         Some(first_workspace_id.as_str())
@@ -2236,6 +2751,9 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 9,
             surface_cols: 80,
             surface_rows: 23,
@@ -2249,10 +2767,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             writer,
         })
     );
-    let initial_revision = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("initial snapshot"),
-    ))
-    .revision;
+    let initial_revision = client_shell_snapshot(&control_rx).revision;
 
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
@@ -2266,14 +2781,11 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     assert_eq!(server.app.state.active, Some(1));
     server.render_and_stream();
 
-    let replacement = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("replacement snapshot"),
-    ));
+    let replacement = client_shell_snapshot(&control_rx);
     assert!(replacement.revision > initial_revision);
     assert_eq!(
         replacement.focused_workspace_id.as_deref(),
@@ -2486,6 +2998,9 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
             client_id: 12,
             surface_cols: 80,
             surface_rows: 23,
@@ -2499,9 +3014,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             writer,
         })
     );
-    let _snapshot = client_shell_snapshot(read_server_message(
-        control_rx.recv().expect("shell snapshot"),
-    ));
+    let _snapshot = client_shell_snapshot(&control_rx);
 
     server.render_and_stream();
     let ServerMessage::PaneSurface(surface) =
@@ -2807,6 +3320,218 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
     assert_eq!(render_impact, RenderImpact::Full);
     assert!(!input_rx.recv().await.expect("encoded release").is_empty());
     shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn worktree_discovery_does_not_block_client_typing() {
+    use api::schema::{Method, WorktreeListParams, WorktreeOpenParams};
+
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("worktree-input");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"", 4);
+    workspace.insert_test_runtime(pane_id, runtime);
+    let repo = std::env::temp_dir().join(format!("herdr-blocked-git-{}", workspace.id));
+    workspace.identity_cwd = repo.clone();
+    workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+        key: repo.display().to_string(),
+        checkout_key: repo.display().to_string(),
+        repo_name: "blocked-git".into(),
+        repo_root: repo.clone(),
+        is_linked_worktree: false,
+    });
+    let workspace_id = workspace.id.clone();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+
+    for (linked, method) in [
+        (
+            false,
+            Method::WorktreeList(WorktreeListParams {
+                workspace_id: Some(workspace_id.clone()),
+                ..Default::default()
+            }),
+        ),
+        (
+            true,
+            Method::WorktreeList(WorktreeListParams {
+                workspace_id: Some(workspace_id.clone()),
+                ..Default::default()
+            }),
+        ),
+        (
+            false,
+            Method::WorktreeOpen(WorktreeOpenParams {
+                workspace_id: Some(workspace_id),
+                path: Some(repo.display().to_string()),
+                focus: true,
+                ..Default::default()
+            }),
+        ),
+    ] {
+        server.app.state.workspaces[0]
+            .cached_git_space
+            .as_mut()
+            .unwrap()
+            .is_linked_worktree = linked;
+        let (entered, release) = crate::worktree::test_list_gate::block(&repo);
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "blocked-read".into(),
+                method,
+            },
+            respond_to,
+            response_write_complete: None,
+        });
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Git discovery started");
+        assert!(response_rx.try_recv().is_err(), "Git must still be blocked");
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id.clone(),
+            events: vec![protocol::ClientPaneInputEvent::TextCommit("x".into())],
+        });
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("typing reaches PTY while Git is blocked"),
+            Bytes::from_static(b"x")
+        );
+        release.send(()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), server.app.event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        server.handle_internal_event_with_forwarding(event);
+        let response: api::schema::ErrorResponse =
+            serde_json::from_str(&response_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .unwrap();
+        assert_eq!(response.error.code, "worktree_list_failed");
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn deferred_worktree_open_disconnect_keeps_other_clients_focus() {
+    let mut server = test_headless_server();
+    let mut source = crate::workspace::Workspace::test_new("pending-open-source");
+    let repo = std::env::temp_dir().join(format!("herdr-disconnected-open-{}", source.id));
+    let checkout = repo.with_extension("checkout");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", repo.to_str().unwrap()]);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "-c",
+        "user.name=Herdr Test",
+        "-c",
+        "user.email=herdr@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "initial",
+    ]);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "pending-open",
+        checkout.to_str().unwrap(),
+    ]);
+    source.identity_cwd = repo.clone();
+    let source_id = source.id.clone();
+    let mut target = crate::workspace::Workspace::test_new("pending-open-target");
+    target.identity_cwd = checkout.clone();
+    server.app.state.workspaces = vec![source, target];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    let (source_control, _) = connect_matching_test_shell(&mut server, 51);
+    let (other_control, _) = connect_matching_test_shell(&mut server, 52);
+    let _ = source_control.recv().unwrap();
+    let _ = other_control.recv().unwrap();
+    let original_tab = server.shell_tab_id_for_client(52);
+
+    let (entered, release) = crate::worktree::test_list_gate::block(&repo);
+    server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+        client_id: 51,
+        boot_id: server.client_shell_boot_id.clone(),
+        request: Box::new(api::schema::Request {
+            id: "open-before-disconnect".into(),
+            method: api::schema::Method::WorktreeOpen(api::schema::WorktreeOpenParams {
+                workspace_id: Some(source_id),
+                branch: Some("pending-open".into()),
+                focus: true,
+                ..Default::default()
+            }),
+        }),
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Git started");
+    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 51 });
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = server.app.event_rx.recv().await.unwrap();
+            let completed = matches!(&event, AppEvent::WorktreeReadFinished(_));
+            server.handle_internal_event_with_forwarding(event);
+            if completed {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        server.app.state.workspaces[1].worktree_space().is_some(),
+        "open completed successfully"
+    );
+    assert_eq!(
+        server.shell_tab_id_for_client(52),
+        original_tab,
+        "disconnected endpoint must not turn into public navigation"
+    );
+    shutdown_test_runtimes(&mut server);
+    git(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "worktree",
+        "remove",
+        checkout.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_dir_all(repo);
 }
 
 #[tokio::test]
@@ -3250,6 +3975,60 @@ fn with_terminal_session_test_server(
     rt.shutdown_timeout(Duration::from_millis(100));
 }
 
+#[test]
+fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let connect = |server: &mut HeadlessServer, client_id| {
+            let (writer, _control, render) = test_client_writer();
+            assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+                client_id,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                writer,
+            }));
+            assert!(
+                server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                    client_id,
+                    target: target.clone(),
+                })
+            );
+            render
+        };
+        let first = connect(server, 7);
+        server.render_and_stream();
+        let _ = first.recv().expect("observer baseline");
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2026h\rPARTIAL");
+        let second = connect(server, 8);
+        server.render_and_stream();
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_err());
+
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\rCOMPLETE\x1b[?2026l");
+        server.render_and_stream();
+        for frames in [&first, &second] {
+            let ServerMessage::Terminal(frame) =
+                read_server_message(frames.recv().expect("complete observer frame"))
+            else {
+                panic!("expected terminal frame");
+            };
+            assert!(String::from_utf8_lossy(&frame.bytes).contains("COMPLETE"));
+        }
+    });
+}
+
 fn connect_pending_terminal_client(server: &mut HeadlessServer, client_id: u64) {
     let _control_rx = connect_pending_terminal_client_with_control_rx(server, client_id);
 }
@@ -3423,6 +4202,53 @@ fn terminal_attach_disconnect_restores_client_shell_pane_size() {
     drop(server);
     drop(_runtime_guard);
     rt.shutdown_timeout(Duration::from_millis(100));
+}
+
+#[cfg(unix)]
+#[test]
+fn backpressured_observer_skips_runtime_access_and_recovers_without_new_output() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let (writer, control, frames) = test_client_writer();
+        server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            writer,
+        });
+        server.handle_server_event(ServerEvent::ClientObserveTerminal {
+            client_id: 7,
+            target,
+        });
+        server.render_and_stream();
+        server.app.terminal_runtimes.insert(
+            terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"LATEST"),
+        );
+        server.render_and_stream();
+        assert_eq!(server.clients[&7].deferred_render(), DeferredRender::Full);
+
+        // An absent runtime makes any attempted rendering observable without timing a lock.
+        let runtime = server.app.terminal_runtimes.remove(&terminal_id).unwrap();
+        server.render_and_stream();
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
+        assert!(
+            server.clients.contains_key(&7),
+            "backpressure must skip runtime access"
+        );
+        assert!(control.try_recv().is_err());
+
+        let _ = frames.recv().expect("previously accepted frame");
+        assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 }));
+        server.render_and_stream();
+        let ServerMessage::Terminal(frame) = read_server_message(frames.recv().unwrap()) else {
+            panic!("terminal update");
+        };
+        assert!(String::from_utf8_lossy(&frame.bytes).contains("LATEST"));
+        assert_eq!(server.clients[&7].deferred_render(), DeferredRender::None);
+    });
 }
 
 #[test]
@@ -3855,6 +4681,37 @@ fn changed_git_refresh_requests_headless_render() {
     });
 
     assert!(changed);
+}
+
+#[tokio::test]
+async fn host_shutdown_preserves_panes_from_queued_and_selected_death_events() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("host-shutdown");
+    let pane_id = workspace.tabs[0].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    let event = || AppEvent::PaneDied {
+        pane_id,
+        exit_reason: crate::platform::ChildExitReason::Exited,
+    };
+    server.app.event_tx.try_send(event()).unwrap();
+    server
+        .host_shutdown_requested
+        .store(true, Ordering::Release);
+    assert_eq!(
+        server.drain_internal_events_with_forwarding_up_to(16),
+        (false, false)
+    );
+    assert!(!server.handle_internal_event_with_forwarding(event()));
+    assert!(server.app.find_pane(pane_id).is_some());
+    assert!(server.app.event_rx.try_recv().is_ok());
+    server
+        .host_shutdown_requested
+        .store(false, Ordering::Release);
+    assert!(server.handle_internal_event_with_forwarding(event()));
+    assert!(server.app.find_pane(pane_id).is_none());
+    shutdown_test_runtimes(&mut server);
 }
 
 #[tokio::test]
@@ -5466,6 +6323,52 @@ fn direct_terminal_mouse_uses_runtime_protocol_encoding() {
 }
 
 #[test]
+fn direct_terminal_mouse_sends_nothing_without_mouse_reporting() {
+    with_terminal_session_test_server(|server, runtime_terminal_id, terminal_id, _pane_id| {
+        // A plain shell never enabled mouse reporting, so a controller's click
+        // must not reach it as stray escape bytes.
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        server
+            .app
+            .terminal_runtimes
+            .insert(runtime_terminal_id, runtime);
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::TerminalAttach {
+                    terminal_id: terminal_id.clone(),
+                },
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+
+        for kind in [
+            protocol::ClientMouseKind::Down(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Drag(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Up(protocol::ClientMouseButton::Left),
+            protocol::ClientMouseKind::Moved,
+        ] {
+            server.handle_server_event(ServerEvent::ClientAttachMouse {
+                client_id: 1,
+                kind,
+                position: protocol::ClientMousePosition::Cell { column: 10, row: 5 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            });
+        }
+        assert!(input_rx.try_recv().is_err());
+    });
+}
+
+#[test]
 fn direct_terminal_pixel_mouse_uses_runtime_tracking_and_coordinates() {
     with_terminal_session_test_server(|server, runtime_terminal_id, terminal_id, _pane_id| {
         let (runtime, mut input_rx) =
@@ -6144,7 +7047,6 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -6207,7 +7109,6 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -6253,7 +7154,6 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -6284,7 +7184,6 @@ fn notification_show_api_reports_no_foreground_client() {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);
@@ -6335,7 +7234,6 @@ fn notification_show_api_includes_sound_in_semantic_event() {
             },
             respond_to,
             response_write_complete: None,
-            stream_active: None,
         })
     );
 
@@ -6363,6 +7261,363 @@ fn notification_show_api_includes_sound_in_semantic_event() {
             );
         }
         other => panic!("expected semantic api notification, got {other:?}"),
+    }
+}
+
+fn completion_guard_server(writer: ClientWriter) -> (HeadlessServer, crate::layout::PaneId) {
+    let mut server = test_headless_server();
+    server.app.state.workspaces = ["background", "active"]
+        .map(crate::workspace::Workspace::test_new)
+        .into();
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(1);
+    server.app.state.toast_config.delay_seconds = 0;
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            Default::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        ),
+    );
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    (server, pane_id)
+}
+
+fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema::Method) {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "completion-probe".into(),
+            method,
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+}
+
+#[test]
+fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    let report = |resume_argv: Vec<&str>| {
+        api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+            pane_id: public_pane_id.clone(),
+            source: "prime-agent".into(),
+            agent: "prime-agent".into(),
+            state: api::schema::PaneAgentState::Idle,
+            message: None,
+            seq: Some(1),
+            agent_session_id: Some("01a0".into()),
+            agent_session_path: None,
+            resume_argv: Some(resume_argv.into_iter().map(String::from).collect()),
+        })
+    };
+
+    completion_guard_api_report(
+        &mut server,
+        report(vec!["prime-agent", "--resume", "01a0", "--model", "x"]),
+    );
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv,
+        vec!["prime-agent", "--resume", "01a0", "--model", "x"]
+    );
+
+    completion_guard_api_report(&mut server, report(vec!["prime-agent", "--resume", "dup"]));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv[2],
+        "01a0",
+        "a duplicate sequence number must not replace the command"
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "invalid-resume".into(),
+            method: report(vec!["/opt/prime/prime-agent", "--resume", "01a0"]),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    assert!(response.contains("invalid_resume_argv"), "{response}");
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .argv[0],
+        "prime-agent"
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "not-owner".into(),
+            method: api::schema::Method::PaneReportAgentSession(
+                api::schema::PaneReportAgentSessionParams {
+                    pane_id: public_pane_id.clone(),
+                    source: "custom:intruder".into(),
+                    agent: "intruder".into(),
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    session_start_source: None,
+                    resume_argv: Some(vec!["intruder".into()]),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    assert!(response.contains("resume_not_accepted"), "{response}");
+    assert_eq!(
+        server.app.state.terminals[&terminal_id]
+            .reported_resume()
+            .unwrap()
+            .agent,
+        "prime-agent"
+    );
+}
+
+#[test]
+fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+        pane_id,
+        agent: crate::detect::Agent::Claude,
+        observed_at: Instant::now(),
+    });
+    let report = |session: &str| {
+        api::schema::Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            seq: None,
+            agent_session_id: Some(session.into()),
+            agent_session_path: None,
+            session_start_source: None,
+            resume_argv: Some(vec!["claude".into(), "--resume".into(), session.into()]),
+        })
+    };
+
+    completion_guard_api_report(&mut server, report("session-a"));
+    completion_guard_api_report(&mut server, report("session-b"));
+
+    let terminal = &server.app.state.terminals[&terminal_id];
+    assert!(terminal
+        .session_ref_is_current(&crate::agent_resume::AgentSessionRef::id("session-a").unwrap()));
+    assert_eq!(
+        terminal.reported_resume().unwrap().argv,
+        vec!["claude", "--resume", "session-a"]
+    );
+}
+
+fn completion_guard_notifications(
+    server: &mut HeadlessServer,
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Vec<protocol::SemanticNotificationKind> {
+    server.send_to_client(
+        1,
+        ServerMessage::EndpointControl {
+            kind: "test.completion-barrier".into(),
+            data: String::new(),
+        },
+    );
+    let mut messages = Vec::new();
+    loop {
+        let message = read_server_message(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("notification barrier"),
+        );
+        if matches!(&message, ServerMessage::EndpointControl { kind, .. } if kind == "test.completion-barrier")
+        {
+            return messages;
+        }
+        if let ServerMessage::SemanticNotification(notification) = message {
+            messages.push(notification.kind);
+        }
+    }
+}
+
+#[test]
+fn completion_guard_api_startup_blocker_respects_suppression() {
+    use protocol::SemanticNotificationKind::{Finished, NeedsAttention};
+
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+        pane_id,
+        agent: crate::detect::Agent::Pi,
+        observed_at: Instant::now(),
+    });
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    for (seq, state) in [
+        api::schema::PaneAgentState::Blocked,
+        api::schema::PaneAgentState::Idle,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        completion_guard_api_report(
+            &mut server,
+            api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "custom:pi".into(),
+                agent: "pi".into(),
+                state,
+                message: None,
+                seq: Some(seq as u64 + 1),
+                agent_session_id: None,
+                agent_session_path: None,
+                resume_argv: None,
+            }),
+        );
+    }
+    let notifications = completion_guard_notifications(&mut server, &control_rx);
+    assert!(notifications.contains(&NeedsAttention));
+    assert!(
+        !notifications.contains(&Finished),
+        "startup: {notifications:?}"
+    );
+}
+
+#[test]
+fn completion_guard_api_session_replacement_does_not_notify_finished() {
+    use crate::agent_resume::{AgentSessionRef, PersistedAgentSession};
+    use crate::detect::{Agent, AgentState};
+    use api::schema::{
+        Method, PaneAgentState, PaneReportAgentParams, PaneReportAgentSessionParams,
+    };
+    use protocol::SemanticNotificationKind::Finished;
+
+    for fallback_state in [
+        AgentState::Unknown,
+        AgentState::Working,
+        AgentState::Blocked,
+    ] {
+        for reason in ["new", "resume", "fork"] {
+            let (writer, control_rx, _render_rx) = test_client_writer();
+            let (mut server, pane_id) = completion_guard_server(writer);
+            let terminal_id = server.app.state.workspaces[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Pi), fallback_state);
+            let cwd = std::env::current_dir().unwrap();
+            let old_session =
+                AgentSessionRef::path(cwd.join("completion-old.jsonl").display().to_string())
+                    .unwrap();
+            let new_session = cwd.join("completion-new.jsonl").display().to_string();
+            terminal.set_persisted_agent_session(PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: old_session.clone(),
+            });
+            terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    Some(old_session),
+                    Some(10),
+                )
+                .expect("initial authority");
+            let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+            completion_guard_api_report(
+                &mut server,
+                Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                    pane_id: public_pane_id.clone(),
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    seq: Some(11),
+                    agent_session_id: None,
+                    agent_session_path: Some(new_session.clone()),
+                    resume_argv: None,
+                    session_start_source: Some(reason.into()),
+                }),
+            );
+            let mut report = PaneReportAgentParams {
+                pane_id: public_pane_id,
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                state: PaneAgentState::Idle,
+                message: None,
+                seq: Some(12),
+                agent_session_id: None,
+                agent_session_path: Some(new_session.clone()),
+                resume_argv: None,
+            };
+            completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
+            let terminal = &server.app.state.terminals[&terminal_id];
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(
+                terminal
+                    .hook_authority
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .as_ref()
+                    .unwrap()
+                    .value,
+                new_session
+            );
+            let notifications = completion_guard_notifications(&mut server, &control_rx);
+            assert!(
+                !notifications.contains(&Finished),
+                "{reason}: {notifications:?}"
+            );
+            assert!(server.app.state.workspaces[0].panes[&pane_id].seen);
+            for (seq, state, expected) in [
+                (13, PaneAgentState::Working, AgentState::Working),
+                (14, PaneAgentState::Idle, AgentState::Idle),
+            ] {
+                report.seq = Some(seq);
+                report.state = state;
+                completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
+                let terminal = &server.app.state.terminals[&terminal_id];
+                assert_eq!(terminal.state, expected);
+                assert_eq!(
+                    terminal.last_agent_completion_seq.is_some(),
+                    expected == AgentState::Idle
+                );
+            }
+            let finished = completion_guard_notifications(&mut server, &control_rx)
+                .into_iter()
+                .filter(|kind| *kind == Finished)
+                .count();
+            assert_eq!(
+                finished, 1,
+                "the first real turn after {reason} must finish"
+            );
+        }
     }
 }
 
@@ -6509,11 +7764,11 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 seq: Some(19),
                 agent_session_id: None,
                 agent_session_path: None,
+                resume_argv: None,
             }),
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
 
     assert!(changed);

@@ -47,7 +47,7 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
-        LocalStream::connect(name)
+        LocalStream::connect(name).map_err(crate::platform::local_server_connection_error)
     }
 }
 
@@ -66,12 +66,14 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
         let listener = ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
+            .security_descriptor(crate::platform::local_server_security_descriptor()?)
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)

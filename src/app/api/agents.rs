@@ -1091,10 +1091,14 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let command = CommandBuilder::new("bash");
+        let mut command = CommandBuilder::new("bash");
+        command.arg("--noprofile");
+        command.arg("--norc");
+        command.arg("-i");
         let mut pane_shell = pair.slave.spawn_command(command).unwrap();
         let shell_pid = pane_shell.process_id().unwrap();
         let mut writer = pair.master.take_writer().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         writer
             .write_all(b"bash -c 'exec -a traex sleep 30'\n")
             .unwrap();

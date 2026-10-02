@@ -279,6 +279,8 @@ fn tab_command() -> Command {
             Command::new("create")
                 .about("Create a tab")
                 .arg(option("workspace", "WORKSPACE_ID"))
+                .arg(option("expected-workspace-label", "TEXT"))
+                .arg(option("token", "TOKEN"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(option("label", "TEXT"))
                 .arg(env_option())
@@ -1357,6 +1359,15 @@ mod tests {
         assert!(has_option(pane_split, "direction"));
         assert!(!has_option(pane_split, "split"));
         assert_eq!(option_values(pane_split, "direction"), ["right", "down"]);
+    }
+
+    #[test]
+    fn spec_models_versioned_exact_token_tab_creation() {
+        let cmd = super::command();
+        let tab_create = command_path(&cmd, &["tab", "create"]);
+        assert!(has_option(tab_create, "workspace"));
+        assert!(has_option(tab_create, "expected-workspace-label"));
+        assert!(has_option(tab_create, "token"));
     }
 
     #[test]

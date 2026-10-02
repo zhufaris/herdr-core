@@ -355,6 +355,7 @@ impl ClientShellState {
             | crate::api::schema::Method::PaneFocusDirection(_) => true,
             crate::api::schema::Method::WorkspaceCreate(params) => params.focus,
             crate::api::schema::Method::TabCreate(params) => params.focus,
+            crate::api::schema::Method::TabCreateV2(params) => params.focus,
             crate::api::schema::Method::PaneSplit(params) => params.focus,
             _ => false,
         };

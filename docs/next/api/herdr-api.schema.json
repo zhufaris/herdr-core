@@ -4628,6 +4628,52 @@
           },
           "type": "object"
         },
+        "TabCreateV2Params": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "expected_workspace_label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token": {
+              "pattern": "^[0-9a-z]{4}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "TabListParams": {
           "properties": {
             "workspace_id": {
@@ -5469,6 +5515,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/TabCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.create.v2",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabCreateV2Params"
             }
           },
           "required": [
@@ -11810,6 +11872,11 @@
             "surface_interest": {
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
+              "type": "boolean"
+            },
+            "tab_create_v2": {
+              "default": false,
+              "description": "Whether this server supports exact native Pane tokens during tab creation.",
               "type": "boolean"
             }
           },

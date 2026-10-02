@@ -184,6 +184,39 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn tab_create_v2_contract_round_trips_without_changing_legacy_creation() {
+    let request = Request {
+        id: "create-orchestrator".into(),
+        method: Method::TabCreateV2(TabCreateV2Params {
+            workspace_id: Some("w4".into()),
+            expected_workspace_label: Some("herdr".into()),
+            token: Some("orch".into()),
+            cwd: Some("/tmp/project".into()),
+            focus: false,
+            label: Some("Orchestrator".into()),
+            env: HashMap::from([("HERDR_AGENT".into(), "traex".into())]),
+        }),
+    };
+
+    let request_json = serde_json::to_value(&request).unwrap();
+    assert_eq!(request_json["method"], "tab.create.v2");
+    assert_eq!(request_json["params"]["expected_workspace_label"], "herdr");
+    assert_eq!(request_json["params"]["token"], "orch");
+    assert_eq!(
+        serde_json::from_value::<Request>(request_json).unwrap(),
+        request
+    );
+
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "legacy-create",
+        "method": "tab.create",
+        "params": {"workspace_id": "w4", "focus": false}
+    }))
+    .unwrap();
+    assert!(matches!(legacy.method, Method::TabCreate(_)));
+}
+
+#[test]
 fn agent_session_rotation_v1_contract_round_trips() {
     let request = Request {
         id: "rotate".into(),
@@ -304,9 +337,14 @@ fn agent_session_rotation_v1_contract_round_trips() {
         health_check: true,
         ssh_agent_registration: false,
         agent_session_rotation_v1: true,
+        tab_create_v2: true,
     };
     assert_eq!(
-        serde_json::to_value(capabilities).unwrap()["agent_session_rotation_v1"],
+        serde_json::to_value(&capabilities).unwrap()["agent_session_rotation_v1"],
+        true
+    );
+    assert_eq!(
+        serde_json::to_value(capabilities).unwrap()["tab_create_v2"],
         true
     );
 }
@@ -908,6 +946,7 @@ fn success_response_round_trips() {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
+                tab_create_v2: true,
             }),
         },
     };

@@ -1,4 +1,5 @@
 use super::harness::*;
+use std::sync::{Arc, Barrier};
 
 #[test]
 fn workspace_and_pane_management_commands_work() {
@@ -762,6 +763,87 @@ fn tab_management_commands_work() {
     assert!(closed_tab.status.success());
     let closed_tab_json: serde_json::Value = serde_json::from_slice(&closed_tab.stdout).unwrap();
     assert_eq!(closed_tab_json["result"]["type"], "ok");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn tab_create_v2_cli_requests_the_exact_token_contract() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().unwrap(),
+            "--label",
+            "herdr",
+        ],
+    );
+    assert!(created.status.success());
+    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let workspace_id = created_json["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let contender_threads = (0..2)
+        .map(|_| {
+            let socket_path = socket_path.clone();
+            let workspace_id = workspace_id.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                run_cli(
+                    &socket_path,
+                    &[
+                        "tab",
+                        "create",
+                        "--workspace",
+                        &workspace_id,
+                        "--expected-workspace-label",
+                        "herdr",
+                        "--token",
+                        "orch",
+                    ],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let contenders = contender_threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let successful = contenders
+        .iter()
+        .filter(|output| output.status.success())
+        .collect::<Vec<_>>();
+    let rejected = contenders
+        .iter()
+        .filter(|output| !output.status.success())
+        .collect::<Vec<_>>();
+    assert_eq!(successful.len(), 1);
+    assert_eq!(rejected.len(), 1);
+    let created_tab_json: serde_json::Value =
+        serde_json::from_slice(&successful[0].stdout).unwrap();
+    assert_eq!(created_tab_json["result"]["type"], "tab_created");
+    assert_eq!(created_tab_json["result"]["root_pane"]["token"], "orch");
+    assert_eq!(
+        created_tab_json["result"]["root_pane"]["workspace_id"],
+        workspace_id
+    );
+    assert!(created_tab_json["result"]["root_pane"]["terminal_id"].is_string());
+    let rejected_json: serde_json::Value = serde_json::from_slice(&rejected[0].stderr).unwrap();
+    assert_eq!(rejected_json["error"]["code"], "pane_token_conflict");
 
     cleanup_spawned_herdr(herdr, base);
 }

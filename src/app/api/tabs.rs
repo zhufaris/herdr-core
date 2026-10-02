@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, ResponseResult, TabCreateParams, TabListParams,
-    TabMoveParams, TabRenameParams, TabTarget,
+    EventData, EventEnvelope, EventKind, ResponseResult, TabCreateParams, TabCreateV2Params,
+    TabListParams, TabMoveParams, TabRenameParams, TabTarget,
 };
 use crate::app::{App, Mode};
 
@@ -52,6 +52,58 @@ impl App {
             label,
             env,
         } = params;
+        self.handle_tab_create_with_identity(
+            id,
+            TabCreateParams {
+                workspace_id,
+                cwd,
+                focus,
+                label,
+                env,
+            },
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn handle_tab_create_v2(&mut self, id: String, params: TabCreateV2Params) -> String {
+        let TabCreateV2Params {
+            workspace_id,
+            expected_workspace_label,
+            token,
+            cwd,
+            focus,
+            label,
+            env,
+        } = params;
+        self.handle_tab_create_with_identity(
+            id,
+            TabCreateParams {
+                workspace_id,
+                cwd,
+                focus,
+                label,
+                env,
+            },
+            expected_workspace_label,
+            token,
+        )
+    }
+
+    fn handle_tab_create_with_identity(
+        &mut self,
+        id: String,
+        params: TabCreateParams,
+        expected_workspace_label: Option<String>,
+        requested_token: Option<String>,
+    ) -> String {
+        let TabCreateParams {
+            workspace_id,
+            cwd,
+            focus,
+            label,
+            env,
+        } = params;
         let ws_idx = if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
@@ -62,6 +114,19 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
+        if let Some(expected_label) = expected_workspace_label {
+            let actual_label = self.workspace_info(ws_idx).label;
+            if actual_label != expected_label {
+                return encode_error(
+                    id,
+                    "workspace_label_mismatch",
+                    format!(
+                        "workspace {} label mismatch: expected {expected_label:?}, found {actual_label:?}",
+                        self.public_workspace_id(ws_idx)
+                    ),
+                );
+            }
+        }
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
             self.resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
         });
@@ -74,9 +139,28 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        let token = match self.state.allocate_pane_token() {
-            Ok(token) => token,
-            Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+        let token = match requested_token {
+            Some(value) => match self.state.requested_pane_token(&value) {
+                Ok(token) => token,
+                Err(crate::app::state::RequestedPaneTokenError::Invalid) => {
+                    return encode_error(
+                        id,
+                        "invalid_pane_token",
+                        "pane token must contain exactly four lowercase base36 characters",
+                    );
+                }
+                Err(crate::app::state::RequestedPaneTokenError::Occupied) => {
+                    return encode_error(
+                        id,
+                        "pane_token_conflict",
+                        format!("pane token {value} is already in use"),
+                    );
+                }
+            },
+            None => match self.state.allocate_pane_token() {
+                Ok(token) => token,
+                Err(err) => return encode_error(id, "pane_token_exhausted", err.to_string()),
+            },
         };
         let result = self
             .state
@@ -322,10 +406,47 @@ mod tests {
     use super::super::test_support::{exiting_test_command, shutdown_test_runtimes};
     use super::*;
     use crate::{
-        api::schema::SuccessResponse,
+        api::schema::{ErrorResponse, Request, SuccessResponse},
         config::{Config, ShellModeConfig},
         workspace::Workspace,
     };
+
+    fn tab_create_test_app(workspace_label: &str) -> App {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub,
+        );
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        app.state.workspaces = vec![Workspace::test_new(workspace_label)];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    fn tab_create_v2_request(
+        workspace_id: &str,
+        expected_workspace_label: &str,
+        token: &str,
+    ) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "id": "create-orchestrator",
+            "method": "tab.create.v2",
+            "params": {
+                "workspace_id": workspace_id,
+                "expected_workspace_label": expected_workspace_label,
+                "token": token,
+                "focus": false
+            }
+        }))
+        .expect("tab.create.v2 request should deserialize")
+    }
 
     #[test]
     fn api_tab_close_last_tab_closes_workspace_and_emits_both_events() {
@@ -431,6 +552,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tab_create_v2_assigns_the_exact_requested_native_token() {
+        let mut app = tab_create_test_app("herdr");
+        let workspace_id = app.public_workspace_id(0);
+        let request = tab_create_v2_request(&workspace_id, "herdr", "orch");
+
+        let response = app.handle_api_request(request);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::TabCreated { tab, root_pane } = success.result else {
+            panic!("expected tab created response");
+        };
+        assert_eq!(root_pane.token.as_deref(), Some("orch"));
+        assert_eq!(root_pane.workspace_id, workspace_id);
+        assert_eq!(root_pane.tab_id, tab.tab_id);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn tab_create_v2_rejects_invalid_and_occupied_tokens_without_creating_a_tab() {
+        let mut app = tab_create_test_app("herdr");
+        let workspace_id = app.public_workspace_id(0);
+        let existing_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let occupied_token = app.state.workspaces[0].tabs[0].panes[&existing_pane]
+            .token
+            .to_string();
+        let initial_tabs = app.state.workspaces[0].tabs.len();
+        let initial_terminals = app.state.terminals.len();
+
+        for (token, expected_code) in [
+            ("ORCH", "invalid_pane_token"),
+            (&occupied_token, "pane_token_conflict"),
+        ] {
+            let response =
+                app.handle_api_request(tab_create_v2_request(&workspace_id, "herdr", token));
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, expected_code);
+            assert_eq!(app.state.workspaces[0].tabs.len(), initial_tabs);
+            assert_eq!(app.state.terminals.len(), initial_terminals);
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_create_v2_rechecks_the_exact_workspace_label_before_creation() {
+        let mut app = tab_create_test_app("renamed");
+        let workspace_id = app.public_workspace_id(0);
+
+        let response =
+            app.handle_api_request(tab_create_v2_request(&workspace_id, "herdr", "orch"));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "workspace_label_mismatch");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert!(app.state.requested_pane_token("orch").is_ok());
+    }
+
+    #[tokio::test]
+    async fn tab_create_v2_rejects_a_missing_workspace_without_creating_a_tab() {
+        let mut app = tab_create_test_app("herdr");
+
+        let response = app.handle_api_request(tab_create_v2_request("w_missing", "herdr", "orch"));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "workspace_not_found");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert!(app.state.requested_pane_token("orch").is_ok());
+    }
+
+    #[tokio::test]
+    async fn serialized_tab_create_v2_requests_produce_only_one_exact_token_owner() {
+        let mut app = tab_create_test_app("herdr");
+        let workspace_id = app.public_workspace_id(0);
+
+        let first = app.handle_api_request(tab_create_v2_request(&workspace_id, "herdr", "orch"));
+        let second = app.handle_api_request(tab_create_v2_request(&workspace_id, "herdr", "orch"));
+
+        let first: SuccessResponse = serde_json::from_str(&first).unwrap();
+        assert!(matches!(first.result, ResponseResult::TabCreated { .. }));
+        let second: ErrorResponse = serde_json::from_str(&second).unwrap();
+        assert_eq!(second.error.code, "pane_token_conflict");
+        let owners = app.state.workspaces[0]
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.values())
+            .filter(|pane| pane.token.as_str() == "orch")
+            .count();
+        assert_eq!(owners, 1);
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn tab_create_v2_launch_failure_leaves_no_pane_or_token_owner() {
+        let mut app = tab_create_test_app("herdr");
+        app.state.default_shell = "/definitely/missing/herdr-shell".into();
+        let workspace_id = app.public_workspace_id(0);
+        let initial_terminals = app.state.terminals.len();
+
+        let response =
+            app.handle_api_request(tab_create_v2_request(&workspace_id, "herdr", "orch"));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "tab_create_failed");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.terminals.len(), initial_terminals);
+        assert!(app.state.requested_pane_token("orch").is_ok());
+    }
+
+    #[tokio::test]
     async fn tab_create_follows_cached_focused_pane_cwd_without_runtime() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -468,7 +697,12 @@ mod tests {
         );
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        assert!(matches!(success.result, ResponseResult::TabCreated { .. }));
+        let ResponseResult::TabCreated { root_pane, .. } = success.result else {
+            panic!("expected tab created response");
+        };
+        let original_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let original_token = app.state.workspaces[0].tabs[0].panes[&original_pane].token;
+        assert_ne!(root_pane.token.as_deref(), Some(original_token.as_str()));
         let created = &app.state.workspaces[0].tabs[1];
         let created_terminal_id = created.terminal_id(created.root_pane).unwrap();
         let created_cwd = &app.state.terminals.get(created_terminal_id).unwrap().cwd;

@@ -39,4 +39,7 @@ pub struct ServerCapabilities {
     /// Whether this server supports exact, idempotent same-Pane Agent-session rotation.
     #[serde(default)]
     pub agent_session_rotation_v1: bool,
+    /// Whether this server supports exact native Pane tokens during tab creation.
+    #[serde(default)]
+    pub tab_create_v2: bool,
 }

@@ -907,6 +907,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn requested_pane_token(
+        &self,
+        value: &str,
+    ) -> Result<crate::pane::PaneToken, RequestedPaneTokenError> {
+        let token = crate::pane::PaneToken::parse(value).ok_or(RequestedPaneTokenError::Invalid)?;
+        let occupied = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.token == token);
+        if occupied {
+            return Err(RequestedPaneTokenError::Occupied);
+        }
+        Ok(token)
+    }
+
     pub(crate) fn allocate_pane_token(&mut self) -> std::io::Result<crate::pane::PaneToken> {
         let used: std::collections::HashSet<_> = self
             .workspaces
@@ -1035,6 +1052,11 @@ impl AppState {
         }
         ws.active_tab().map(|tab| tab.layout.focused()) == Some(pane_id)
     }
+}
+
+pub(crate) enum RequestedPaneTokenError {
+    Invalid,
+    Occupied,
 }
 
 #[cfg(test)]

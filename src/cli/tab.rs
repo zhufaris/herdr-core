@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::api::schema::{TabCreateParams, TabListParams, TabRenameParams};
+use crate::api::schema::{TabCreateParams, TabCreateV2Params, TabListParams, TabRenameParams};
 
 pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -55,6 +55,8 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
     let mut cwd = None;
     let mut focus = false;
     let mut label = None;
+    let mut expected_workspace_label = None;
+    let mut token = None;
     let mut env = HashMap::new();
 
     let mut index = 0;
@@ -82,6 +84,22 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 label = Some(value.clone());
+                index += 2;
+            }
+            "--expected-workspace-label" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --expected-workspace-label");
+                    return Ok(2);
+                };
+                expected_workspace_label = Some(value.clone());
+                index += 2;
+            }
+            "--token" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --token");
+                    return Ok(2);
+                };
+                token = Some(value.clone());
                 index += 2;
             }
             "--focus" => {
@@ -114,13 +132,25 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    super::runtime::tab_create(TabCreateParams {
-        workspace_id,
-        cwd,
-        focus,
-        label,
-        env,
-    })
+    if expected_workspace_label.is_some() || token.is_some() {
+        super::runtime::tab_create_v2(TabCreateV2Params {
+            workspace_id,
+            expected_workspace_label,
+            token,
+            cwd,
+            focus,
+            label,
+            env,
+        })
+    } else {
+        super::runtime::tab_create(TabCreateParams {
+            workspace_id,
+            cwd,
+            focus,
+            label,
+            env,
+        })
+    }
 }
 
 fn tab_get(args: &[String]) -> std::io::Result<i32> {
@@ -178,7 +208,7 @@ fn print_tab_help() {
     eprintln!("herdr tab commands:");
     eprintln!("  herdr tab list [--workspace <workspace_id>]");
     eprintln!(
-        "  herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]"
+        "  herdr tab create [--workspace <workspace_id>] [--expected-workspace-label TEXT] [--token TOKEN] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]"
     );
     eprintln!("  herdr tab get <tab_id>");
     eprintln!("  herdr tab focus <tab_id>");

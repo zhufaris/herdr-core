@@ -78,6 +78,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         agent_session_rotation_v1: cfg!(unix),
+        tab_create_v2: true,
     })
 }
 
@@ -797,6 +798,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::WorktreeOpen(_) => "worktree.open",
         Method::WorktreeRemove(_) => "worktree.remove",
         Method::TabCreate(_) => "tab.create",
+        Method::TabCreateV2(_) => "tab.create.v2",
         Method::TabList(_) => "tab.list",
         Method::TabGet(_) => "tab.get",
         Method::TabFocus(_) => "tab.focus",
@@ -1662,6 +1664,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
+                tab_create_v2: true,
             }),
             None,
             None,

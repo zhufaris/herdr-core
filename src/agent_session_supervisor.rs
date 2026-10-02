@@ -3,11 +3,15 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::time::Instant;
 
 use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -274,6 +274,7 @@ impl App {
                 code: "unsupported_agent_kind".into(),
                 message: format!("unsupported interactive agent kind {kind}"),
             },
+            #[cfg(unix)]
             AgentStartError::UnsupportedRotatableKind(kind) => crate::api::schema::ErrorBody {
                 code: "unsupported_rotatable_agent_kind".into(),
                 message: format!("interactive agent kind {kind} cannot use rotatable launch"),
@@ -487,6 +488,7 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 pub(super) enum AgentStartError {
     InvalidName,
     UnsupportedKind(String),
+    #[cfg(unix)]
     UnsupportedRotatableKind(String),
     SupervisorUnavailable(String),
     InvalidArgument,

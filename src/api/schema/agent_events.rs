@@ -269,6 +269,17 @@ pub enum GoalStatus {
     UsageLimited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivityState {
+    Started,
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReplyPayload {
@@ -308,6 +319,12 @@ pub enum ReplyPayload {
         status: GoalStatus,
         source_updated_at: u64,
         truncated: bool,
+    },
+    AgentActivity {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        state: AgentActivityState,
     },
     BranchChanged {
         parent_id: Option<String>,

@@ -1,5 +1,7 @@
 use super::{digest, EventError, Result};
-use crate::api::schema::agent_events::{GoalStatus, ReplyPayload, TranscriptKind};
+use crate::api::schema::agent_events::{
+    AgentActivityState, GoalStatus, ReplyPayload, TranscriptKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -7,6 +9,9 @@ use std::sync::OnceLock;
 
 const MAX_TEXT: usize = 16 * 1024;
 const MAX_NODES: usize = 16_384;
+const MAX_AGENT_LABELS: usize = 1_024;
+const MAX_AGENT_DISPLAY_NAME_CHARS: usize = 80;
+const MAX_REASONING_SUMMARY_CHARS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingHumanMessage {
@@ -27,6 +32,8 @@ pub(crate) struct Decoder {
     last_node: Option<String>,
     nodes: BTreeMap<String, Option<String>>,
     last_message: Option<(String, String)>,
+    #[serde(default)]
+    agent_labels: BTreeMap<String, String>,
 }
 #[derive(Debug)]
 pub(crate) struct Decoded {
@@ -71,6 +78,75 @@ fn bounded(s: &str) -> (String, bool) {
         value.push_str("\n[truncated]");
     }
     (value, truncated)
+}
+
+fn reasoning_heading(value: &str) -> Option<(String, bool)> {
+    static HEADING: OnceLock<regex::Regex> = OnceLock::new();
+    let captures = HEADING
+        .get_or_init(|| {
+            regex::Regex::new(r"(?s)^\s*\*\*([^*\r\n]+)\*\*").expect("reasoning heading regex")
+        })
+        .captures(value)?;
+    let heading = captures
+        .get(1)?
+        .as_str()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if heading.is_empty() {
+        return None;
+    }
+    let safe = redact(&heading);
+    let mut chars = safe.chars();
+    let summary = chars
+        .by_ref()
+        .take(MAX_REASONING_SUMMARY_CHARS)
+        .collect::<String>();
+    let truncated = chars.next().is_some();
+    Some((summary, truncated))
+}
+
+fn agent_display_name(value: Option<&str>) -> Option<String> {
+    let safe = redact(value?)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if safe.is_empty() {
+        return None;
+    }
+    Some(safe.chars().take(MAX_AGENT_DISPLAY_NAME_CHARS).collect())
+}
+
+fn agent_activity_state(value: &str) -> Option<AgentActivityState> {
+    match value {
+        "pending_init" | "started" => Some(AgentActivityState::Started),
+        "running" | "interacted" => Some(AgentActivityState::Running),
+        "completed" => Some(AgentActivityState::Completed),
+        "failed" | "error" | "not_found" => Some(AgentActivityState::Failed),
+        "interrupted" => Some(AgentActivityState::Interrupted),
+        "blocked" => Some(AgentActivityState::Blocked),
+        _ => None,
+    }
+}
+
+fn collab_close_state(value: &Value) -> Option<AgentActivityState> {
+    if let Some(value) = value.as_str() {
+        return agent_activity_state(value);
+    }
+    let object = value.as_object()?;
+    for key in [
+        "completed",
+        "failed",
+        "error",
+        "interrupted",
+        "blocked",
+        "running",
+    ] {
+        if object.contains_key(key) {
+            return agent_activity_state(key);
+        }
+    }
+    None
 }
 
 pub(crate) fn human_message_digest(value: &str) -> String {
@@ -174,6 +250,48 @@ impl Decoder {
                 text,
                 truncated,
                 submission_id: None,
+            },
+        ));
+    }
+
+    fn reasoning_message(id: &str, body: &str, out: &mut Vec<(String, ReplyPayload)>) {
+        let Some((text, truncated)) = reasoning_heading(body) else {
+            return;
+        };
+        out.push((
+            format!("message:{id}:{}", digest(text.as_bytes())),
+            ReplyPayload::Message {
+                message_id: id.to_owned(),
+                channel: "reasoning".to_owned(),
+                text,
+                truncated,
+            },
+        ));
+    }
+
+    fn agent_activity(
+        &mut self,
+        event_id: &str,
+        agent_id: &str,
+        display_name: Option<&str>,
+        state: AgentActivityState,
+        out: &mut Vec<(String, ReplyPayload)>,
+    ) {
+        let display_name =
+            agent_display_name(display_name).or_else(|| self.agent_labels.get(agent_id).cloned());
+        if let Some(name) = display_name.as_ref() {
+            if self.agent_labels.contains_key(agent_id)
+                || self.agent_labels.len() < MAX_AGENT_LABELS
+            {
+                self.agent_labels.insert(agent_id.to_owned(), name.clone());
+            }
+        }
+        out.push((
+            format!("agent:{event_id}"),
+            ReplyPayload::AgentActivity {
+                agent_id: agent_id.to_owned(),
+                display_name,
+                state,
             },
         ));
     }
@@ -292,6 +410,42 @@ impl Decoder {
                         },
                     ));
                 }
+                Some("collab_agent_spawn_end") => {
+                    let event_id = required(p, "call_id")?;
+                    let agent_id = required(p, "new_thread_id")?;
+                    let Some(state) = p["status"].as_str().and_then(agent_activity_state) else {
+                        return Err(EventError("invalid_agent_activity_state"));
+                    };
+                    self.agent_activity(
+                        event_id,
+                        agent_id,
+                        p["new_agent_nickname"].as_str(),
+                        state,
+                        out,
+                    );
+                }
+                Some("sub_agent_activity") => {
+                    let event_id = required(p, "event_id")?;
+                    let agent_id = required(p, "agent_thread_id")?;
+                    let Some(state) = p["kind"].as_str().and_then(agent_activity_state) else {
+                        return Err(EventError("invalid_agent_activity_state"));
+                    };
+                    self.agent_activity(event_id, agent_id, None, state, out);
+                }
+                Some("collab_close_end") => {
+                    let event_id = required(p, "call_id")?;
+                    let agent_id = required(p, "receiver_thread_id")?;
+                    let Some(state) = collab_close_state(&p["status"]) else {
+                        return Err(EventError("invalid_agent_activity_state"));
+                    };
+                    self.agent_activity(
+                        event_id,
+                        agent_id,
+                        p["receiver_agent_nickname"].as_str(),
+                        state,
+                        out,
+                    );
+                }
                 Some(_) => {}
                 None => return Err(EventError("invalid_record")),
             },
@@ -347,6 +501,10 @@ impl Decoder {
             }
             Some("message") if item["role"] == "assistant" => {
                 if matches!(item["channel"].as_str(), Some("analysis" | "reasoning")) {
+                    if !self.awaiting_turn_boundary && self.turn.is_some() {
+                        let id = required(item, "id")?;
+                        Self::reasoning_message(id, &text(&item["content"]), out);
+                    }
                     return Ok(());
                 }
                 if self.turn.is_none() {
@@ -412,7 +570,21 @@ impl Decoder {
                     },
                 ));
             }
-            Some("message" | "reasoning" | "ghost_snapshot" | "trae_extra_info") => {}
+            Some("reasoning") => {
+                if !self.awaiting_turn_boundary && self.turn.is_some() {
+                    let id = required(item, "id")?;
+                    let body = item["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| part["type"] == "reasoning_text")
+                        .filter_map(|part| part["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    Self::reasoning_message(id, &body, out);
+                }
+            }
+            Some("message" | "ghost_snapshot" | "trae_extra_info") => {}
             _ => return Err(EventError("unsupported_response_item")),
         }
         Ok(())
@@ -620,16 +792,40 @@ mod tests {
             .all(|event| event.turn.as_deref() == Some("user-1")));
     }
     #[test]
-    fn traex_filters_reasoning_and_updates_final_message_identity() {
+    fn traex_projects_only_a_safe_reasoning_heading_without_changing_final_identity() {
         let mut d = Decoder::default();
         d.decode(
             TranscriptKind::Traex,
             &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
         )
         .unwrap();
-        let items = json!({"type":"history_mutation","payload":{"operation":"append","items":[{"type":"message","id":"secret","role":"assistant","channel":"analysis","content":[{"type":"output_text","text":"private"}]},{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}});
+        let items = json!({"type":"history_mutation","payload":{"operation":"append","items":[
+            {"type":"message","id":"secret","role":"assistant","channel":"analysis","content":[{"type":"output_text","text":"**Inspecting authorization: Bearer live-token**\n\nprivate chain of thought"}]},
+            {"type":"reasoning","id":"nested","content":[{"type":"reasoning_text","text":"**Checking nested records**\n\nprivate nested reasoning"}]},
+            {"type":"message","id":"ignored","role":"assistant","channel":"reasoning","content":[{"type":"output_text","text":"unstructured private reasoning"}]},
+            {"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        ]}});
         let events = d.decode(TranscriptKind::Traex, &items).unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0].payload,
+            ReplyPayload::Message { message_id, channel, text, truncated: false }
+                if message_id == "secret" && channel == "reasoning"
+                    && text == "Inspecting authorization: Bearer [REDACTED]"
+        ));
+        assert!(matches!(
+            &events[1].payload,
+            ReplyPayload::Message { message_id, channel, text, truncated: false }
+                if message_id == "nested" && channel == "reasoning"
+                    && text == "Checking nested records"
+        ));
+        assert!(events.iter().all(|event| match &event.payload {
+            ReplyPayload::Message { text, .. } =>
+                !text.contains("private chain of thought")
+                    && !text.contains("private nested reasoning")
+                    && !text.contains("unstructured private reasoning"),
+            _ => true,
+        }));
         let final_events = d.decode(TranscriptKind::Traex, &json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"answer"}})).unwrap();
         assert!(
             matches!(&final_events[0].payload, ReplyPayload::Message { message_id, channel, .. } if message_id == "m" && channel == "final")
@@ -637,6 +833,30 @@ mod tests {
         assert!(matches!(
             final_events[1].payload,
             ReplyPayload::TurnCompleted
+        ));
+    }
+
+    #[test]
+    fn traex_bounds_reasoning_heading_by_unicode_characters() {
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
+            )
+            .unwrap();
+        let heading = format!("**{}**\nprivate", "界".repeat(200));
+        let events = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"response_item","payload":{"type":"message","id":"reasoning-1","role":"assistant","channel":"reasoning","content":[{"type":"output_text","text":heading}]}}),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &events[0].payload,
+            ReplyPayload::Message { channel, text, truncated: true, .. }
+                if channel == "reasoning" && text.chars().count() == 160
         ));
     }
     #[test]
@@ -663,6 +883,141 @@ mod tests {
         assert!(
             matches!(&events[1].payload, ReplyPayload::ToolResult { call_id, text, .. } if call_id == "call-1" && text == "passed")
         );
+    }
+
+    #[test]
+    fn traex_projects_bounded_agent_lifecycle_without_private_fields() {
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
+            )
+            .unwrap();
+
+        let spawn = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"collab_agent_spawn_end",
+                        "call_id":"spawn-call",
+                        "new_thread_id":"agent-1",
+                        "new_agent_nickname":"Galileo",
+                        "prompt":"private prompt",
+                        "status":"pending_init"
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            &spawn[0].payload,
+            ReplyPayload::AgentActivity { agent_id, display_name: Some(name), state: AgentActivityState::Started }
+                if agent_id == "agent-1" && name == "Galileo"
+        ));
+        let serialized = serde_json::to_string(&spawn[0].payload).unwrap();
+        assert!(!serialized.contains("private prompt"));
+
+        let running = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"sub_agent_activity",
+                        "event_id":"activity-call",
+                        "agent_thread_id":"agent-1",
+                        "agent_path":"/private/worktree",
+                        "kind":"interacted"
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            &running[0].payload,
+            ReplyPayload::AgentActivity { agent_id, display_name: Some(name), state: AgentActivityState::Running }
+                if agent_id == "agent-1" && name == "Galileo"
+        ));
+        assert!(!serde_json::to_string(&running[0].payload)
+            .unwrap()
+            .contains("/private/worktree"));
+
+        let completed = decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"collab_close_end",
+                        "call_id":"close-call",
+                        "receiver_thread_id":"agent-1",
+                        "receiver_agent_nickname":"Galileo",
+                        "status":{"completed":"private completion prose"}
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            &completed[0].payload,
+            ReplyPayload::AgentActivity { agent_id, display_name: Some(name), state: AgentActivityState::Completed }
+                if agent_id == "agent-1" && name == "Galileo"
+        ));
+        assert!(!serde_json::to_string(&completed[0].payload)
+            .unwrap()
+            .contains("private completion prose"));
+    }
+
+    #[test]
+    fn traex_restores_agent_labels_and_maps_terminal_states_after_checkpoint() {
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(
+                TranscriptKind::Traex,
+                &json!({
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"collab_agent_spawn_end",
+                        "call_id":"spawn-call",
+                        "new_thread_id":"agent-1",
+                        "new_agent_nickname":"Galileo",
+                        "status":"pending_init"
+                    }
+                }),
+            )
+            .unwrap();
+        let mut restored: Decoder =
+            serde_json::from_str(&serde_json::to_string(&decoder).unwrap()).unwrap();
+
+        for (kind, expected) in [
+            ("started", AgentActivityState::Started),
+            ("interacted", AgentActivityState::Running),
+            ("interrupted", AgentActivityState::Interrupted),
+            ("blocked", AgentActivityState::Blocked),
+            ("failed", AgentActivityState::Failed),
+            ("completed", AgentActivityState::Completed),
+        ] {
+            let events = restored
+                .decode(
+                    TranscriptKind::Traex,
+                    &json!({
+                        "type":"event_msg",
+                        "payload":{
+                            "type":"sub_agent_activity",
+                            "event_id":format!("event-{kind}"),
+                            "agent_thread_id":"agent-1",
+                            "agent_path":"/must/not/escape",
+                            "kind":kind
+                        }
+                    }),
+                )
+                .unwrap();
+            assert!(matches!(
+                &events[0].payload,
+                ReplyPayload::AgentActivity { display_name: Some(name), state, .. }
+                    if name == "Galileo" && *state == expected
+            ));
+        }
     }
     #[test]
     fn traex_projects_native_goal_updates_without_parsing_exec() {

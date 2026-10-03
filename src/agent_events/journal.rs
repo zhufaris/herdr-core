@@ -297,15 +297,15 @@ impl Journal {
         source: &RegisteredSource,
         initial: &Checkpoint,
     ) -> Result<Checkpoint> {
-        let existing: Option<(String, String)> = self
-            .db
+        let definition = serde_json::to_string(source)?;
+        let tx = self.db.transaction()?;
+        let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT definition,checkpoint FROM sources WHERE id=?",
                 [&source.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let definition = serde_json::to_string(source)?;
         if let Some((existing_definition, existing_checkpoint)) = existing {
             let existing_source: RegisteredSource = serde_json::from_str(&existing_definition)?;
             if existing_source.terminal_id != source.terminal_id
@@ -316,22 +316,27 @@ impl Journal {
             {
                 return Err(EventError("source_identity_conflict"));
             }
-            self.db.execute(
+            tx.execute(
                 "UPDATE sources SET definition=?,state='active',error=NULL WHERE id=?",
                 params![definition, source.id],
             )?;
-            return Ok(serde_json::from_str(&existing_checkpoint)?);
+            let checkpoint = serde_json::from_str(&existing_checkpoint)?;
+            tx.commit()?;
+            return Ok(checkpoint);
         }
-        let count: i64 = self
-            .db
-            .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))?;
+        let mut count: i64 = tx.query_row("SELECT count(*) FROM sources", [], |r| r.get(0))?;
         if count >= MAX_SOURCES {
-            return Err(EventError("source_limit"));
+            reclaim_failed_source_registrations(&tx, 1)?;
+            count = tx.query_row("SELECT count(*) FROM sources", [], |r| r.get(0))?;
+            if count >= MAX_SOURCES {
+                return Err(EventError("source_limit"));
+            }
         }
-        self.db.execute(
+        tx.execute(
             "INSERT INTO sources(id,definition,checkpoint) VALUES (?,?,?)",
             params![source.id, definition, serde_json::to_string(initial)?],
         )?;
+        tx.commit()?;
         Ok(initial.clone())
     }
 
@@ -1423,9 +1428,34 @@ impl Journal {
         let through = expired.max(oversized);
         tx.execute("UPDATE sources SET floor=MAX(floor,COALESCE((SELECT MAX(seq) FROM events WHERE source=sources.id AND seq<=?),0))", [through])?;
         tx.execute("DELETE FROM events WHERE seq<=?", [through])?;
+        reclaim_failed_source_registrations(&tx, i64::MAX)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+fn reclaim_failed_source_registrations(
+    tx: &rusqlite::Transaction<'_>,
+    limit: i64,
+) -> Result<usize> {
+    let mut statement =
+        tx.prepare("SELECT id FROM sources WHERE state='error' ORDER BY latest,id LIMIT ?")?;
+    let source_ids = statement
+        .query_map([limit], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    for source_id in &source_ids {
+        tx.execute("DELETE FROM source_panes WHERE source=?", [source_id])?;
+        tx.execute(
+            "DELETE FROM session_native_state WHERE source=?",
+            [source_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sources WHERE id=? AND state='error'",
+            [source_id],
+        )?;
+    }
+    Ok(source_ids.len())
 }
 
 fn native_submission_state_name(state: NativePromptSubmissionState) -> &'static str {
@@ -1657,6 +1687,19 @@ mod tests {
     use super::*;
     use crate::api::schema::agent_events::{GoalStatus, TranscriptKind};
 
+    fn registered_source(id: &str) -> RegisteredSource {
+        RegisteredSource {
+            id: id.into(),
+            terminal_id: format!("term-{id}"),
+            kind: TranscriptKind::Traex,
+            session_id: format!("session-{id}"),
+            path: format!("/unused/{id}.jsonl").into(),
+            foreground_pid: 1,
+            header_hash: format!("header-{id}"),
+            file_identity: format!("file-{id}"),
+        }
+    }
+
     #[test]
     fn timestamp_comparison_tolerates_only_subsecond_precision_loss() {
         assert!(timestamps_equal(
@@ -1740,6 +1783,249 @@ mod tests {
         assert_eq!(floor, 4997);
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruning_reclaims_failed_source_registrations_without_removing_active_sources() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-source-prune-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let active = registered_source("active");
+        let failed = registered_source("failed");
+        let mut journal = Journal::open(&path).unwrap();
+        journal.attach(&active, &Checkpoint::default()).unwrap();
+        journal.attach(&failed, &Checkpoint::default()).unwrap();
+        journal
+            .bind_source_to_pane(&active.id, "pane-active")
+            .unwrap();
+        journal
+            .bind_source_to_pane(&failed.id, "pane-failed")
+            .unwrap();
+        journal
+            .db
+            .execute(
+                "INSERT INTO session_native_state(source,kind,value) VALUES (?,'status','active')",
+                [&active.id],
+            )
+            .unwrap();
+        journal
+            .db
+            .execute(
+                "INSERT INTO session_native_state(source,kind,value) VALUES (?,'status','failed')",
+                [&failed.id],
+            )
+            .unwrap();
+        journal
+            .prepare_submission(
+                "prompt-failed",
+                &failed.terminal_id,
+                TranscriptKind::Traex,
+                &failed.session_id,
+                "continue",
+            )
+            .unwrap();
+        journal
+            .settle_submission("prompt-failed", NativePromptSubmissionState::Accepted)
+            .unwrap();
+        let before = Checkpoint::default();
+        let mut after = before.clone();
+        after.offset = 10;
+        journal
+            .commit(
+                &failed,
+                &before,
+                &after,
+                vec![
+                    Decoded {
+                        key: "start".into(),
+                        turn: Some("turn-failed".into()),
+                        time: "2026-10-03T00:00:00Z".into(),
+                        payload: ReplyPayload::TurnStarted,
+                    },
+                    Decoded {
+                        key: "human".into(),
+                        turn: Some("turn-failed".into()),
+                        time: "2026-10-03T00:00:01Z".into(),
+                        payload: ReplyPayload::HumanMessage {
+                            message_id: "human-failed".into(),
+                            text: "continue".into(),
+                            truncated: false,
+                            submission_id: None,
+                        },
+                    },
+                    Decoded {
+                        key: "complete".into(),
+                        turn: Some("turn-failed".into()),
+                        time: "2026-10-03T00:00:02Z".into(),
+                        payload: ReplyPayload::TurnCompleted,
+                    },
+                ],
+            )
+            .unwrap();
+        journal.fail(&failed, "runtime_identity_changed").unwrap();
+        let retained_events: i64 = journal
+            .db
+            .query_row(
+                "SELECT count(*) FROM events WHERE source=?",
+                [&failed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        journal.prune_to(i64::MAX, 0).unwrap();
+
+        let sources = journal.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id, active.id);
+        assert_eq!(sources[0].state, "active");
+        assert_eq!(
+            journal.read(&failed.id, "start", 64).unwrap_err().0,
+            "source_not_found"
+        );
+        assert_eq!(
+            journal
+                .db
+                .query_row(
+                    "SELECT count(*) FROM events WHERE source=?",
+                    [&failed.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            retained_events
+        );
+        assert_eq!(
+            journal
+                .db
+                .query_row("SELECT count(*) FROM turn_index", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            journal
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: "prompt-failed".into(),
+                })
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Terminal
+        );
+        assert_eq!(
+            journal
+                .native_submission_receipt("prompt-failed")
+                .unwrap()
+                .state,
+            NativePromptSubmissionState::Accepted
+        );
+        for table in ["source_panes", "session_native_state"] {
+            assert_eq!(
+                journal
+                    .db
+                    .query_row(
+                        &format!("SELECT count(*) FROM {table} WHERE source=?"),
+                        [&failed.id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                journal
+                    .db
+                    .query_row(
+                        &format!("SELECT count(*) FROM {table} WHERE source=?"),
+                        [&active.id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn full_registry_reclaims_only_the_oldest_failed_source_for_a_new_attach() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-source-capacity-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        let sources = (0..MAX_SOURCES)
+            .map(|index| registered_source(&format!("source-{index:03}")))
+            .collect::<Vec<_>>();
+        for source in &sources {
+            journal.attach(source, &Checkpoint::default()).unwrap();
+        }
+        journal
+            .fail(&sources[0], "runtime_identity_changed")
+            .unwrap();
+        journal.fail(&sources[1], "invalid_record").unwrap();
+        let replacement = registered_source("replacement");
+
+        journal
+            .attach(&replacement, &Checkpoint::default())
+            .unwrap();
+
+        let registered = journal.sources().unwrap();
+        assert_eq!(registered.len(), MAX_SOURCES as usize);
+        assert!(!registered
+            .iter()
+            .any(|source| source.source_id == sources[0].id));
+        assert!(registered
+            .iter()
+            .any(|source| source.source_id == sources[1].id && source.state == "error"));
+        assert!(registered
+            .iter()
+            .any(|source| source.source_id == replacement.id && source.state == "active"));
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn full_active_registry_refuses_new_sources_but_allows_matching_reattach() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-active-capacity-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        let sources = (0..MAX_SOURCES)
+            .map(|index| registered_source(&format!("active-{index:03}")))
+            .collect::<Vec<_>>();
+        for source in &sources {
+            journal.attach(source, &Checkpoint::default()).unwrap();
+        }
+
+        assert_eq!(
+            journal
+                .attach(&registered_source("replacement"), &Checkpoint::default())
+                .unwrap_err()
+                .0,
+            "source_limit"
+        );
+        assert_eq!(
+            journal.attach(&sources[0], &Checkpoint::default()).unwrap(),
+            Checkpoint::default()
+        );
+        assert_eq!(journal.sources().unwrap().len(), MAX_SOURCES as usize);
+        assert!(journal
+            .sources()
+            .unwrap()
+            .iter()
+            .all(|source| source.state == "active"));
+
+        drop(journal);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2371,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn recovers_an_exact_pruned_turn_without_reading_later_transcript_content() {
+    fn recovers_an_exact_turn_after_failed_source_registration_is_reclaimed() {
         use std::io::Write as _;
 
         let root = std::env::temp_dir().join(format!(
@@ -2436,11 +2722,16 @@ mod tests {
             )
             .unwrap();
         drop(transcript);
+        journal.fail(&source, "runtime_identity_changed").unwrap();
         journal
             .db
             .execute("UPDATE events SET created=0", [])
             .unwrap();
         journal.prune().unwrap();
+        assert_eq!(
+            journal.read(&source.id, "start", 64).unwrap_err().0,
+            "source_not_found"
+        );
 
         let mut recovered = Vec::new();
         let mut cursor = None;

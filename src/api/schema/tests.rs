@@ -411,6 +411,7 @@ fn agent_session_rotation_v1_contract_round_trips() {
         agent_session_rotation_v1: true,
         tab_create_v2: true,
         pane_identity_reconcile_v1: true,
+        session_event_stream_v1: true,
     };
     assert_eq!(
         serde_json::to_value(&capabilities).unwrap()["agent_session_rotation_v1"],
@@ -1021,6 +1022,7 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                session_event_stream_v1: true,
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
@@ -1032,6 +1034,44 @@ fn success_response_round_trips() {
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn frozen_session_event_stream_fixture_matches_public_response_types() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/herdr-session-events-v1.json"
+    ))
+    .unwrap();
+
+    let capability: ResponseResult = serde_json::from_value(fixture["capability"].clone()).unwrap();
+    let ResponseResult::Pong {
+        version,
+        protocol,
+        capabilities: Some(capabilities),
+    } = capability
+    else {
+        panic!("fixture capability is not a pong response");
+    };
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(protocol, crate::protocol::PROTOCOL_VERSION);
+    assert!(capabilities.session_event_stream_v1);
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["opened"].clone()).unwrap(),
+        ResponseResult::SessionEventsOpened { .. }
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["batch"].clone()).unwrap(),
+        ResponseResult::SessionEventsBatch { .. }
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ResponseResult>(fixture["receipt"].clone()).unwrap(),
+        ResponseResult::AgentEventsSubmissionReceipt { .. }
+    ));
+
+    let cursor_expired = &fixture["cursorExpired"];
+    assert_eq!(cursor_expired["code"], "cursor_expired");
+    assert_eq!(cursor_expired["earliest_cursor"], "cursor-4");
+    assert_eq!(cursor_expired["latest_cursor"], "cursor-10");
 }
 
 #[test]
@@ -1796,6 +1836,122 @@ fn agent_events_locate_requires_an_explicit_boundary() {
     };
     assert_eq!(params.boundary, agent_events::AgentEventsTurnBoundary::At);
     assert_eq!(params.turn_id.as_deref(), Some("turn-1"));
+}
+
+#[test]
+fn agent_events_submission_receipt_has_a_stable_public_shape() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "submission-receipt",
+        "method": "agent.events.submission",
+        "params": { "submission_id": "prompt-1" }
+    }))
+    .unwrap();
+    let Method::AgentEventsSubmission(params) = request.method else {
+        panic!("expected agent.events.submission");
+    };
+    assert_eq!(params.submission_id, "prompt-1");
+
+    let result = ResponseResult::AgentEventsSubmissionReceipt {
+        receipt: agent_events::AgentEventsSubmissionReceipt {
+            submission_id: "prompt-1".into(),
+            agent_kind: agent_events::TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            state: agent_events::AgentEventsSubmissionState::Observed,
+            turn_id: Some("turn-1".into()),
+            started_at: Some("2026-10-03T00:00:00Z".into()),
+            terminal_state: None,
+        }
+        .into(),
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({
+            "type": "agent_events_submission_receipt",
+            "submission_id": "prompt-1",
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "state": "observed",
+            "turn_id": "turn-1",
+            "started_at": "2026-10-03T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn session_event_stream_contract_is_path_free_and_cursor_bounded() {
+    let open: Request = serde_json::from_value(serde_json::json!({
+        "id": "stream-open",
+        "method": "session.events.open",
+        "params": { "pane_id": "w1:p1" }
+    }))
+    .unwrap();
+    let Method::SessionEventsOpen(params) = open.method else {
+        panic!("expected session.events.open");
+    };
+    assert_eq!(params.pane_id, "w1:p1");
+
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "id": "stream-open-with-path",
+        "method": "session.events.open",
+        "params": { "pane_id": "w1:p1", "path": "/tmp/session.jsonl" }
+    }))
+    .is_err());
+
+    let read: Request = serde_json::from_value(serde_json::json!({
+        "id": "stream-read",
+        "method": "session.events.read",
+        "params": { "stream_id": "epoch-1", "after": "cursor-1", "limit": 64 }
+    }))
+    .unwrap();
+    let Method::SessionEventsRead(params) = read.method else {
+        panic!("expected session.events.read");
+    };
+    assert_eq!(params.stream_id, "epoch-1");
+    assert_eq!(params.limit, 64);
+
+    let opened = ResponseResult::SessionEventsOpened {
+        stream: agent_events::SessionEventStream {
+            stream_id: "epoch-1".into(),
+            terminal_id: "terminal-1".into(),
+            agent_kind: agent_events::TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            earliest_cursor: "cursor-0".into(),
+            latest_cursor: "cursor-9".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(opened).unwrap(),
+        serde_json::json!({
+            "type": "session_events_opened",
+            "stream_id": "epoch-1",
+            "terminal_id": "terminal-1",
+            "agent_kind": "traex",
+            "session_id": "session-1",
+            "earliest_cursor": "cursor-0",
+            "latest_cursor": "cursor-9"
+        })
+    );
+
+    let batch = ResponseResult::SessionEventsBatch {
+        batch: agent_events::SessionEventsBatch {
+            stream_id: "epoch-1".into(),
+            events: vec![],
+            next_cursor: "cursor-4".into(),
+            earliest_cursor: "cursor-2".into(),
+            latest_cursor: "cursor-9".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(batch).unwrap(),
+        serde_json::json!({
+            "type": "session_events_batch",
+            "stream_id": "epoch-1",
+            "events": [],
+            "next_cursor": "cursor-4",
+            "earliest_cursor": "cursor-2",
+            "latest_cursor": "cursor-9"
+        })
+    );
 }
 
 #[test]

@@ -2,10 +2,8 @@ mod codec;
 mod journal;
 mod source;
 
-pub(crate) use journal::{Journal, SubmissionPrepareResult};
-#[cfg(test)]
-pub(crate) use source::Checkpoint;
-pub(crate) use source::{RegisteredSource, SourceReader};
+pub(crate) use journal::{Journal, JournalAvailability, SubmissionPrepareResult};
+pub(crate) use source::{Checkpoint, RegisteredSource, SourceReader};
 
 use std::fmt;
 

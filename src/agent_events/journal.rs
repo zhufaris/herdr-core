@@ -6,7 +6,8 @@ use crate::api::schema::agent_events::{
     AgentEventsRecoverTurnParams, AgentEventsRecoveryBatch, AgentEventsRecoveryOutcome,
     AgentEventsSubmissionParams, AgentEventsSubmissionReceipt, AgentEventsSubmissionState,
     AgentEventsTurnBoundary, AgentEventsTurnCursor, AgentEventsTurnList, AgentEventsTurnSummary,
-    AgentReplyEvent, ReplyPayload, TranscriptKind,
+    AgentReplyEvent, NativePromptSubmissionReceipt, NativePromptSubmissionState, ReplyPayload,
+    TranscriptKind,
 };
 use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,7 +17,7 @@ use std::path::Path;
 const MAX_SOURCES: i64 = 256;
 const RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 const MAX_EVENT_BYTES: i64 = 192 * 1024 * 1024;
-const JOURNAL_VERSION: i64 = 4;
+const JOURNAL_VERSION: i64 = 5;
 const HISTORY_INDEX_BATCHES_PER_LOOKUP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +70,12 @@ pub(crate) enum SubmissionPrepareResult {
     Duplicate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalAvailability {
+    pub source_id: String,
+    pub latest_cursor: String,
+}
+
 pub(crate) struct Journal {
     db: Connection,
     id: String,
@@ -90,7 +97,7 @@ impl Journal {
         writer_lock
             .try_lock()
             .map_err(|_| EventError("journal_writer_busy"))?;
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > JOURNAL_VERSION {
@@ -101,7 +108,9 @@ impl Journal {
             INSERT OR IGNORE INTO metadata VALUES ('id', lower(hex(randomblob(16))));
             CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, definition TEXT NOT NULL, checkpoint TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', error TEXT, floor INTEGER NOT NULL DEFAULT 0, latest INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, UNIQUE(source,key));
-            CREATE INDEX IF NOT EXISTS events_source_seq ON events(source,seq);")?;
+            CREATE INDEX IF NOT EXISTS events_source_seq ON events(source,seq);
+            CREATE TABLE IF NOT EXISTS source_panes (source TEXT PRIMARY KEY, pane_id TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS session_native_state (source TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(source,kind));")?;
         let pending_submission_columns = {
             let mut statement = db.prepare("PRAGMA table_info(pending_submissions)")?;
             let columns = statement
@@ -141,7 +150,11 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=4;")?;
+                CREATE TABLE native_submission_receipts (
+                  submission_id TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                  created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                PRAGMA user_version=5;")?;
         } else if version == 1 {
             db.execute_batch("BEGIN IMMEDIATE;
                 DROP INDEX IF EXISTS pending_submissions_match;
@@ -156,7 +169,6 @@ impl Journal {
                   SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
                     CASE state WHEN 'prepared' THEN 'prepared' ELSE 'legacy_unavailable' END,created,created
                   FROM pending_submissions_v1;
-                DROP TABLE pending_submissions_v1;
                 CREATE INDEX pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
                 CREATE TABLE turn_index (
                   transcript_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -165,7 +177,16 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=4;
+                CREATE TABLE native_submission_receipts (
+                  submission_id TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                  created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                INSERT INTO native_submission_receipts(submission_id,state,created,updated)
+                  SELECT submission_id,
+                    CASE state WHEN 'prepared' THEN 'prepared' ELSE 'accepted' END,
+                    created,created FROM pending_submissions_v1;
+                DROP TABLE pending_submissions_v1;
+                PRAGMA user_version=5;
                 COMMIT;")?;
         } else if matches!(version, 2 | 3) && has_stream_submission_schema {
             // The stream-only v2/v3 journal converted any prepared receipt to uncertain
@@ -184,6 +205,14 @@ impl Journal {
                   SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
                     'legacy_unavailable',created,updated
                   FROM pending_submissions_stream_legacy;
+                CREATE TABLE native_submission_receipts (
+                  submission_id TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                  created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                INSERT INTO native_submission_receipts(submission_id,state,created,updated)
+                  SELECT submission_id,state,created,updated FROM pending_submissions_stream_legacy;
+                UPDATE native_submission_receipts SET state='uncertain',updated=strftime('%s','now')
+                  WHERE state='prepared';
                 DROP TABLE pending_submissions_stream_legacy;
                 CREATE INDEX pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
                 CREATE TABLE IF NOT EXISTS turn_index (
@@ -193,18 +222,70 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=4;
+                PRAGMA user_version=5;
                 COMMIT;")?;
         } else if matches!(version, 2..=4) && has_rich_submission_schema {
             db.execute_batch("CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
                 CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=4;")?;
+                CREATE TABLE IF NOT EXISTS native_submission_receipts (
+                  submission_id TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                  created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                INSERT OR IGNORE INTO native_submission_receipts(submission_id,state,created,updated)
+                  SELECT submission_id,
+                    CASE state
+                      WHEN 'observed' THEN 'accepted'
+                      WHEN 'terminal' THEN 'accepted'
+                      WHEN 'cancelled' THEN 'rejected'
+                      ELSE 'uncertain'
+                    END,
+                    created,updated FROM pending_submissions;
+                PRAGMA user_version=5;")?;
+        } else if version == 5 && has_rich_submission_schema {
+            db.execute_batch("CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
+                CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
+                CREATE TABLE IF NOT EXISTS native_submission_receipts (
+                  submission_id TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                  created INTEGER NOT NULL, updated INTEGER NOT NULL);")?;
         } else {
             return Err(EventError("unsupported_journal_schema"));
         }
-        let id = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
+        let id: String = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
             r.get(0)
         })?;
+        let tx = db.transaction()?;
+        let prepared = {
+            let mut stmt = tx.prepare(
+                "SELECT submission_id FROM native_submission_receipts WHERE state='prepared'",
+            )?;
+            let values = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            values
+        };
+        tx.execute(
+            "UPDATE native_submission_receipts SET state='uncertain',updated=? WHERE state='prepared'",
+            [now()],
+        )?;
+        for submission_id in prepared {
+            let receipt = native_submission_receipt_from(&tx, &submission_id)?;
+            if let Some(source) = matching_source_for_native_receipt(&tx, &receipt)? {
+                insert_event(
+                    &tx,
+                    &id,
+                    &source,
+                    &format!("submission:{submission_id}:uncertain"),
+                    None,
+                    super::timestamp(),
+                    ReplyPayload::SubmissionReceipt {
+                        submission_id,
+                        state: NativePromptSubmissionState::Uncertain,
+                    },
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(Self {
             db,
             id,
@@ -226,12 +307,18 @@ impl Journal {
             .optional()?;
         let definition = serde_json::to_string(source)?;
         if let Some((existing_definition, existing_checkpoint)) = existing {
-            if definition != existing_definition {
+            let existing_source: RegisteredSource = serde_json::from_str(&existing_definition)?;
+            if existing_source.terminal_id != source.terminal_id
+                || existing_source.kind != source.kind
+                || existing_source.session_id != source.session_id
+                || existing_source.header_hash != source.header_hash
+                || existing_source.file_identity != source.file_identity
+            {
                 return Err(EventError("source_identity_conflict"));
             }
             self.db.execute(
-                "UPDATE sources SET state='active',error=NULL WHERE id=?",
-                [&source.id],
+                "UPDATE sources SET definition=?,state='active',error=NULL WHERE id=?",
+                params![definition, source.id],
             )?;
             return Ok(serde_json::from_str(&existing_checkpoint)?);
         }
@@ -246,6 +333,31 @@ impl Journal {
             params![source.id, definition, serde_json::to_string(initial)?],
         )?;
         Ok(initial.clone())
+    }
+
+    pub(crate) fn bind_source_to_pane(&mut self, source_id: &str, pane_id: &str) -> Result<()> {
+        if pane_id.is_empty() || pane_id.len() > 256 {
+            return Err(EventError("invalid_pane_id"));
+        }
+        let tx = self.db.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE id=?)",
+            [source_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(EventError("source_not_found"));
+        }
+        tx.execute(
+            "DELETE FROM source_panes WHERE pane_id=? OR source=?",
+            params![pane_id, source_id],
+        )?;
+        tx.execute(
+            "INSERT INTO source_panes(source,pane_id) VALUES (?,?)",
+            params![source_id, pane_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn prepare_submission(
@@ -286,19 +398,17 @@ impl Journal {
             return Err(EventError("submission_identity_conflict"));
         }
         let timestamp = now();
-        self.db.execute(
+        let tx = self.db.transaction()?;
+        tx.execute(
             "INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created,updated) VALUES (?,?,?,?,?,'prepared',?,?)",
             params![submission_id, terminal_id, kind, session_id, text_digest, timestamp, timestamp],
         )?;
-        Ok(SubmissionPrepareResult::Prepared)
-    }
-
-    pub(crate) fn cancel_prepared_submission(&mut self, submission_id: &str) -> Result<()> {
-        self.db.execute(
-            "UPDATE pending_submissions SET state='cancelled',updated=? WHERE submission_id=? AND state='prepared'",
-            params![now(), submission_id],
+        tx.execute(
+            "INSERT INTO native_submission_receipts(submission_id,state,created,updated) VALUES (?,'prepared',?,?)",
+            params![submission_id, timestamp, timestamp],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(SubmissionPrepareResult::Prepared)
     }
 
     pub fn submission(
@@ -342,6 +452,129 @@ impl Journal {
             terminal_state,
         })
     }
+
+    pub(crate) fn native_submission_receipt(
+        &self,
+        submission_id: &str,
+    ) -> Result<NativePromptSubmissionReceipt> {
+        if submission_id.is_empty() || submission_id.len() > 256 {
+            return Err(EventError("invalid_submission_id"));
+        }
+        native_submission_receipt_from(&self.db, submission_id)
+    }
+
+    pub(crate) fn settle_submission(
+        &mut self,
+        submission_id: &str,
+        expected_state: NativePromptSubmissionState,
+    ) -> Result<(NativePromptSubmissionReceipt, Option<JournalAvailability>)> {
+        if expected_state == NativePromptSubmissionState::Prepared {
+            return Ok((self.native_submission_receipt(submission_id)?, None));
+        }
+        let stored_state = native_submission_state_name(expected_state);
+        let journal_id = self.id.clone();
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE native_submission_receipts SET state=?,updated=?
+             WHERE submission_id=? AND state='prepared'",
+            params![stored_state, now(), submission_id],
+        )?;
+        if expected_state == NativePromptSubmissionState::Rejected {
+            tx.execute(
+                "UPDATE pending_submissions SET state='cancelled',updated=?
+                 WHERE submission_id=? AND state='prepared'",
+                params![now(), submission_id],
+            )?;
+        }
+        let receipt = native_submission_receipt_from(&tx, submission_id)?;
+        if receipt.state != expected_state {
+            return Err(EventError("submission_state_conflict"));
+        }
+        let source = matching_source_for_native_receipt(&tx, &receipt)?;
+        let inserted = if let Some(source) = source.as_ref() {
+            insert_event(
+                &tx,
+                &journal_id,
+                source,
+                &format!("submission:{}:{stored_state}", receipt.submission_id),
+                None,
+                super::timestamp(),
+                ReplyPayload::SubmissionReceipt {
+                    submission_id: receipt.submission_id.clone(),
+                    state: receipt.state,
+                },
+            )?
+        } else {
+            None
+        };
+        tx.commit()?;
+        let availability = source
+            .zip(inserted)
+            .map(|(source, sequence)| JournalAvailability {
+                source_id: source.id.clone(),
+                latest_cursor: self.cursor(&source.id, sequence),
+            });
+        Ok((receipt, availability))
+    }
+
+    pub(crate) fn record_core_event(
+        &mut self,
+        runtime_key: &str,
+        event: &crate::api::schema::EventEnvelope,
+    ) -> Result<Option<JournalAvailability>> {
+        let Some((pane_id, kind, payload)) = normalize_core_event(event) else {
+            return Ok(None);
+        };
+        let source: Option<RegisteredSource> = self
+            .db
+            .query_row(
+                "SELECT s.definition FROM source_panes p JOIN sources s ON s.id=p.source
+                 WHERE p.pane_id=? AND s.state='active'",
+                [pane_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|definition| serde_json::from_str(&definition))
+            .transpose()?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let journal_id = self.id.clone();
+        let tx = self.db.transaction()?;
+        let state_value = serde_json::to_string(&payload)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM session_native_state WHERE source=? AND kind=?",
+                params![source.id, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(state_value.as_str()) {
+            return Ok(None);
+        }
+        let inserted = insert_event(
+            &tx,
+            &journal_id,
+            &source,
+            &format!("core:{runtime_key}:{kind}"),
+            None,
+            super::timestamp(),
+            payload,
+        )?;
+        if inserted.is_some() {
+            tx.execute(
+                "INSERT INTO session_native_state(source,kind,value) VALUES (?,?,?)
+                 ON CONFLICT(source,kind) DO UPDATE SET value=excluded.value",
+                params![source.id, kind, state_value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted.map(|sequence| JournalAvailability {
+            source_id: source.id.clone(),
+            latest_cursor: self.cursor(&source.id, sequence),
+        }))
+    }
+
     pub(crate) fn pending(&self, verify_all: bool) -> Result<Vec<(RegisteredSource, Checkpoint)>> {
         let mut stmt = self.db.prepare("SELECT definition,json_extract(checkpoint,'$.offset') FROM sources WHERE state='active'")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -1173,6 +1406,10 @@ impl Journal {
     pub fn prune(&mut self) -> Result<()> {
         self.prune_to(MAX_EVENT_BYTES, now() - RETENTION_SECONDS)
     }
+    #[cfg(test)]
+    pub(crate) fn expire_all_for_test(&mut self) -> Result<()> {
+        self.prune_to(0, i64::MAX)
+    }
     fn prune_to(&mut self, max_bytes: i64, cutoff: i64) -> Result<()> {
         let tx = self.db.transaction()?;
         let expired: i64 = tx.query_row(
@@ -1188,6 +1425,162 @@ impl Journal {
         tx.execute("DELETE FROM events WHERE seq<=?", [through])?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn native_submission_state_name(state: NativePromptSubmissionState) -> &'static str {
+    match state {
+        NativePromptSubmissionState::Prepared => "prepared",
+        NativePromptSubmissionState::Accepted => "accepted",
+        NativePromptSubmissionState::Rejected => "rejected",
+        NativePromptSubmissionState::Uncertain => "uncertain",
+    }
+}
+
+fn native_submission_receipt_from(
+    db: &rusqlite::Connection,
+    submission_id: &str,
+) -> Result<NativePromptSubmissionReceipt> {
+    db.query_row(
+        "SELECT p.terminal_id,p.agent_kind,p.session_id,n.state,n.created,n.updated
+         FROM pending_submissions p JOIN native_submission_receipts n USING(submission_id)
+         WHERE p.submission_id=?",
+        [submission_id],
+        |row| {
+            let kind: String = row.get(1)?;
+            let state: String = row.get(3)?;
+            Ok(NativePromptSubmissionReceipt {
+                submission_id: submission_id.to_owned(),
+                terminal_id: row.get(0)?,
+                agent_kind: match kind.as_str() {
+                    "traex" => TranscriptKind::Traex,
+                    "pi" => TranscriptKind::Pi,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                },
+                session_id: row.get(2)?,
+                state: match state.as_str() {
+                    "prepared" => NativePromptSubmissionState::Prepared,
+                    "accepted" => NativePromptSubmissionState::Accepted,
+                    "rejected" => NativePromptSubmissionState::Rejected,
+                    "uncertain" => NativePromptSubmissionState::Uncertain,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                },
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(EventError("submission_not_found"))
+}
+
+fn matching_source_for_native_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &NativePromptSubmissionReceipt,
+) -> Result<Option<RegisteredSource>> {
+    let mut stmt = tx.prepare(
+        "SELECT s.definition FROM sources s JOIN source_panes p ON p.source=s.id
+         WHERE s.state='active'",
+    )?;
+    let definitions = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for definition in definitions {
+        let source: RegisteredSource = serde_json::from_str(&definition)?;
+        if source.terminal_id == receipt.terminal_id
+            && source.kind == receipt.agent_kind
+            && source.session_id == receipt.session_id
+        {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
+}
+
+fn insert_event(
+    tx: &rusqlite::Transaction<'_>,
+    journal_id: &str,
+    source: &RegisteredSource,
+    key: &str,
+    turn_id: Option<String>,
+    occurred_at: String,
+    payload: ReplyPayload,
+) -> Result<Option<i64>> {
+    let body = AgentReplyEvent {
+        schema_version: 1,
+        event_id: digest(format!("{journal_id}:{}:{key}", source.id).as_bytes()),
+        cursor: String::new(),
+        source_id: source.id.clone(),
+        agent_kind: source.kind,
+        session_id: source.session_id.clone(),
+        turn_id,
+        occurred_at,
+        payload,
+    };
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO events(source,key,body,created) VALUES (?,?,?,?)",
+        params![source.id, key, serde_json::to_string(&body)?, now()],
+    )?;
+    if inserted == 0 {
+        return Ok(None);
+    }
+    let sequence = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE sources SET latest=? WHERE id=?",
+        params![sequence, source.id],
+    )?;
+    Ok(Some(sequence))
+}
+
+fn normalize_core_event(
+    event: &crate::api::schema::EventEnvelope,
+) -> Option<(&str, &'static str, ReplyPayload)> {
+    use crate::api::schema::EventData;
+    match &event.data {
+        EventData::PaneAgentStatusChanged {
+            pane_id,
+            agent_status,
+            ..
+        } => Some((
+            pane_id,
+            "runtime_status_changed",
+            ReplyPayload::RuntimeStatusChanged {
+                pane_id: pane_id.clone(),
+                status: *agent_status,
+            },
+        )),
+        EventData::PaneAgentDetected {
+            pane_id,
+            released,
+            final_status,
+            ..
+        } => Some((
+            pane_id,
+            "runtime_agent_changed",
+            ReplyPayload::RuntimeAgentChanged {
+                pane_id: pane_id.clone(),
+                released: *released,
+                final_status: *final_status,
+            },
+        )),
+        EventData::PaneExited { pane_id, .. } => Some((
+            pane_id,
+            "runtime_ended",
+            ReplyPayload::RuntimeEnded {
+                pane_id: pane_id.clone(),
+                reason: "exited".into(),
+            },
+        )),
+        EventData::PaneClosed { pane_id, .. } => Some((
+            pane_id,
+            "runtime_ended",
+            ReplyPayload::RuntimeEnded {
+                pane_id: pane_id.clone(),
+                reason: "closed".into(),
+            },
+        )),
+        _ => None,
     }
 }
 
@@ -1558,7 +1951,7 @@ mod tests {
             .db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(created_version, 4);
+        assert_eq!(created_version, JOURNAL_VERSION);
         let before = journal.attach(&source, &Checkpoint::default()).unwrap();
         assert_eq!(
             journal
@@ -1583,6 +1976,27 @@ mod tests {
                 )
                 .unwrap(),
             SubmissionPrepareResult::Duplicate
+        );
+        assert_eq!(
+            journal.native_submission_receipt("prompt-1").unwrap().state,
+            NativePromptSubmissionState::Prepared
+        );
+        assert_eq!(
+            journal
+                .settle_submission("prompt-1", NativePromptSubmissionState::Accepted)
+                .unwrap()
+                .0
+                .state,
+            NativePromptSubmissionState::Accepted
+        );
+        assert_eq!(
+            journal
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: "prompt-1".into(),
+                })
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Prepared
         );
         let mut next = before.clone();
         next.offset = 10;
@@ -1626,6 +2040,10 @@ mod tests {
         assert_eq!(receipt.state, AgentEventsSubmissionState::Observed);
         assert_eq!(receipt.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(receipt.started_at.as_deref(), Some("2026-09-28T00:00:00Z"));
+        assert_eq!(
+            journal.native_submission_receipt("prompt-1").unwrap().state,
+            NativePromptSubmissionState::Accepted
+        );
         journal.db.execute_batch("PRAGMA user_version=2;").unwrap();
         drop(journal);
         let mut reopened = Journal::open(&path).unwrap();
@@ -1633,7 +2051,14 @@ mod tests {
             .db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated_version, 4);
+        assert_eq!(migrated_version, JOURNAL_VERSION);
+        assert_eq!(
+            reopened
+                .native_submission_receipt("prompt-1")
+                .unwrap()
+                .state,
+            NativePromptSubmissionState::Accepted
+        );
         assert_eq!(
             reopened
                 .prepare_submission(
@@ -1645,6 +2070,47 @@ mod tests {
                 )
                 .unwrap(),
             SubmissionPrepareResult::Duplicate
+        );
+        drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prepared_native_receipt_becomes_uncertain_on_reopen_without_losing_recovery_state() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-native-uncertain-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .prepare_submission(
+                "prompt-uncertain",
+                "term",
+                TranscriptKind::Traex,
+                "session",
+                "continue",
+            )
+            .unwrap();
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .native_submission_receipt("prompt-uncertain")
+                .unwrap()
+                .state,
+            NativePromptSubmissionState::Uncertain
+        );
+        assert_eq!(
+            reopened
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: "prompt-uncertain".into(),
+                })
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::Prepared
         );
         drop(reopened);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
@@ -1687,7 +2153,7 @@ mod tests {
             .db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, JOURNAL_VERSION);
         drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -1741,7 +2207,7 @@ mod tests {
             .db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, JOURNAL_VERSION);
 
         for submission_id in ["prepared", "accepted", "rejected", "uncertain"] {
             let receipt = journal
@@ -1851,7 +2317,7 @@ mod tests {
             .db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, JOURNAL_VERSION);
         drop(journal);
 
         let reopened = Journal::open(&path).unwrap();

@@ -710,6 +710,26 @@
             },
             {
               "properties": {
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/event/$defs/PaneLayoutSnapshot"
                 },
@@ -753,6 +773,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "session_events_available",
             "layout_updated"
           ],
           "type": "string"
@@ -4281,6 +4302,40 @@
           ],
           "type": "object"
         },
+        "SessionEventsOpenParams": {
+          "additionalProperties": false,
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "SessionEventsReadParams": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "default": "start",
+              "type": "string"
+            },
+            "limit": {
+              "default": 64,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream_id"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -4558,6 +4613,18 @@
               "properties": {
                 "type": {
                   "const": "pane.agent_detected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "session.events.available",
                   "type": "string"
                 }
               },
@@ -6693,6 +6760,54 @@
         {
           "properties": {
             "method": {
+              "const": "session.events.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.events.read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.events.subscribe",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionEventsReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "events.subscribe",
               "type": "string"
             },
@@ -7244,6 +7359,47 @@
             "ambiguous"
           ],
           "type": "string"
+        },
+        "AgentEventsSubmissionReceipt": {
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "started_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
+            },
+            "submission_id": {
+              "type": "string"
+            },
+            "terminal_state": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "submission_id",
+            "state",
+            "agent_kind",
+            "session_id"
+          ],
+          "type": "object"
         },
         "AgentEventsSubmissionState": {
           "enum": [
@@ -8395,6 +8551,26 @@
             },
             {
               "properties": {
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "layout": {
                   "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
                 },
@@ -8453,6 +8629,7 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
+            "session_events_available",
             "layout_updated"
           ],
           "type": "string"
@@ -8756,6 +8933,52 @@
               "type": "object"
             }
           ]
+        },
+        "NativePromptSubmissionReceipt": {
+          "properties": {
+            "agent_kind": {
+              "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+            },
+            "created_at": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/NativePromptSubmissionState"
+            },
+            "submission_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "updated_at": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "submission_id",
+            "terminal_id",
+            "agent_kind",
+            "session_id",
+            "state",
+            "created_at",
+            "updated_at"
+          ],
+          "type": "object"
+        },
+        "NativePromptSubmissionState": {
+          "enum": [
+            "prepared",
+            "accepted",
+            "rejected",
+            "uncertain"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10419,6 +10642,96 @@
             },
             {
               "properties": {
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/NativePromptSubmissionState"
+                },
+                "submission_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "submission_receipt",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "submission_id",
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                },
+                "type": {
+                  "const": "runtime_status_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "runtime_agent_changed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "released"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "runtime_ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "code": {
                   "type": "string"
                 },
@@ -10789,6 +11102,16 @@
                     "null"
                   ]
                 },
+                "submission_receipt": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/NativePromptSubmissionReceipt"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -10951,48 +11274,22 @@
               "type": "object"
             },
             {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionReceipt"
+                },
+                {
+                  "$ref": "#/schemas/success_response/$defs/NativePromptSubmissionReceipt"
+                }
+              ],
               "properties": {
-                "agent_kind": {
-                  "$ref": "#/schemas/success_response/$defs/TranscriptKind"
-                },
-                "session_id": {
-                  "type": "string"
-                },
-                "started_at": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "state": {
-                  "$ref": "#/schemas/success_response/$defs/AgentEventsSubmissionState"
-                },
-                "submission_id": {
-                  "type": "string"
-                },
-                "terminal_state": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "turn_id": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
                 "type": {
                   "const": "agent_events_submission_receipt",
                   "type": "string"
                 }
               },
               "required": [
-                "type",
-                "submission_id",
-                "state",
-                "agent_kind",
-                "session_id"
+                "type"
               ],
               "type": "object"
             },
@@ -11059,6 +11356,77 @@
                 "type",
                 "turns",
                 "complete"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_kind": {
+                  "$ref": "#/schemas/success_response/$defs/TranscriptKind"
+                },
+                "earliest_cursor": {
+                  "type": "string"
+                },
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "terminal_id",
+                "agent_kind",
+                "session_id",
+                "earliest_cursor",
+                "latest_cursor"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "earliest_cursor": {
+                  "type": "string"
+                },
+                "events": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentReplyEvent"
+                  },
+                  "type": "array"
+                },
+                "latest_cursor": {
+                  "type": "string"
+                },
+                "next_cursor": {
+                  "type": "string"
+                },
+                "stream_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "session_events_batch",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream_id",
+                "events",
+                "next_cursor",
+                "earliest_cursor",
+                "latest_cursor"
               ],
               "type": "object"
             },
@@ -12016,6 +12384,11 @@
             "pane_identity_reconcile_v1": {
               "default": false,
               "description": "Whether this server supports idempotent in-place Pane identity reconciliation.",
+              "type": "boolean"
+            },
+            "session_event_stream_v1": {
+              "default": false,
+              "description": "Whether this server exposes the path-free, cursor-based session event stream.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

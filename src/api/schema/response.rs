@@ -108,6 +108,8 @@ pub enum ResponseResult {
         agent: AgentInfo,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submission_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_receipt: Option<super::agent_events::NativePromptSubmissionReceipt>,
     },
     AgentList {
         agents: Vec<AgentInfo>,
@@ -135,7 +137,7 @@ pub enum ResponseResult {
     },
     AgentEventsSubmissionReceipt {
         #[serde(flatten)]
-        receipt: super::agent_events::AgentEventsSubmissionReceipt,
+        receipt: super::agent_events::AgentEventsSubmissionReceiptResult,
     },
     AgentEventsRecoveryBatch {
         #[serde(flatten)]
@@ -144,6 +146,14 @@ pub enum ResponseResult {
     AgentEventsTurnList {
         #[serde(flatten)]
         turns: super::agent_events::AgentEventsTurnList,
+    },
+    SessionEventsOpened {
+        #[serde(flatten)]
+        stream: super::agent_events::SessionEventStream,
+    },
+    SessionEventsBatch {
+        #[serde(flatten)]
+        batch: super::agent_events::SessionEventsBatch,
     },
     AgentView {
         active: bool,

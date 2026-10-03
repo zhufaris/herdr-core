@@ -33,6 +33,41 @@ pub(crate) struct Checkpoint {
 pub(crate) struct SourceReader;
 
 impl SourceReader {
+    pub(crate) fn register_path_session(
+        terminal_id: String,
+        kind: TranscriptKind,
+        path: &Path,
+        foreground_pid: u32,
+        roots: &[PathBuf],
+    ) -> Result<RegisteredSource> {
+        let path = path.canonicalize()?;
+        if !roots
+            .iter()
+            .filter_map(|candidate| candidate.canonicalize().ok())
+            .any(|root| path.starts_with(root))
+        {
+            return Err(EventError("source_path_not_allowed"));
+        }
+        let mut file = open_regular(&path)?;
+        let line = match read_line(&mut file)? {
+            ReadLine::Complete(line) => line,
+            ReadLine::Incomplete => return Err(EventError("incomplete_session_header")),
+            ReadLine::OversizedComplete { .. } => return Err(EventError("record_too_large")),
+        };
+        let header: Value = serde_json::from_slice(&line)?;
+        let session_id = match kind {
+            TranscriptKind::Traex if header["type"] == "session_meta" => {
+                header["payload"]["id"].as_str()
+            }
+            TranscriptKind::Pi if header["type"] == "session" => header["id"].as_str(),
+            _ => None,
+        }
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or(EventError("session_identity_missing"))?
+        .to_owned();
+        Self::register(terminal_id, kind, session_id, &path, foreground_pid, roots)
+    }
+
     pub(crate) fn checkpoint_at_end(source: &RegisteredSource) -> Result<Checkpoint> {
         let mut file = open_regular(&source.path)?;
         let length = file.metadata()?.len();
@@ -92,8 +127,17 @@ impl SourceReader {
         if actual != Some(session_id.as_str()) {
             return Err(EventError("session_identity_mismatch"));
         }
+        let header_hash = digest(&line);
+        let file_identity = crate::platform::agent_event_file_identity(&file)?;
         let id = digest(
-            serde_json::to_string(&(&terminal_id, kind, &session_id, foreground_pid))?.as_bytes(),
+            serde_json::to_string(&(
+                &terminal_id,
+                kind,
+                &session_id,
+                &header_hash,
+                &file_identity,
+            ))?
+            .as_bytes(),
         );
         Ok(RegisteredSource {
             id,
@@ -102,8 +146,8 @@ impl SourceReader {
             session_id,
             path,
             foreground_pid,
-            header_hash: digest(&line),
-            file_identity: crate::platform::agent_event_file_identity(&file)?,
+            header_hash,
+            file_identity,
         })
     }
 
@@ -325,6 +369,80 @@ mod tests {
     use super::*;
     use crate::api::schema::agent_events::ReplyPayload;
     use std::io::Write;
+
+    #[test]
+    fn session_epoch_survives_core_restart_and_changes_when_the_source_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-source-epoch-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n",
+        )
+        .unwrap();
+
+        let before = SourceReader::register(
+            "terminal-1".into(),
+            TranscriptKind::Traex,
+            "session-1".into(),
+            &path,
+            10,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let after_core_restart = SourceReader::register(
+            "terminal-1".into(),
+            TranscriptKind::Traex,
+            "session-1".into(),
+            &path,
+            20,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_eq!(before.id, after_core_restart.id);
+
+        let replacement = root.join("replacement.jsonl");
+        std::fs::write(
+            &replacement,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n",
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after_source_replacement = SourceReader::register(
+            "terminal-1".into(),
+            TranscriptKind::Traex,
+            "session-1".into(),
+            &path,
+            20,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_ne!(before.id, after_source_replacement.id);
+
+        let next_session_path = root.join("next-session.jsonl");
+        std::fs::write(
+            &next_session_path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-2\"}}\n",
+        )
+        .unwrap();
+        let next_session = SourceReader::register(
+            "terminal-1".into(),
+            TranscriptKind::Traex,
+            "session-2".into(),
+            &next_session_path,
+            20,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_ne!(after_source_replacement.id, next_session.id);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn incremental_capture_scales_with_one_and_fifteen_sources() {
         let dir = std::env::temp_dir().join(format!(

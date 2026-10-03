@@ -280,6 +280,7 @@ struct ServerCapabilitiesJson {
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
+    session_event_stream_v1: bool,
     ssh_agent_registration: bool,
 }
 
@@ -326,6 +327,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
+                    session_event_stream_v1: capabilities.session_event_stream_v1,
                     ssh_agent_registration: capabilities.ssh_agent_registration,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
@@ -424,6 +426,7 @@ mod tests {
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
+                session_event_stream_v1: false,
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
@@ -448,6 +451,24 @@ mod tests {
 
         assert_eq!(restart_needed_bool(&server), Some(false));
         assert_eq!(server_binary_stale_bool(&server), Some(true));
+    }
+
+    #[test]
+    fn server_status_exposes_session_event_stream_capability() {
+        let mut server = running_server(
+            Some(crate::build_info::version().as_str()),
+            Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        );
+        let ServerRuntimeStatus::Running { capabilities, .. } = &mut server else {
+            unreachable!();
+        };
+        capabilities.as_mut().unwrap().session_event_stream_v1 = true;
+
+        let value = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(
+            value.pointer("/capabilities/session_event_stream_v1"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[test]

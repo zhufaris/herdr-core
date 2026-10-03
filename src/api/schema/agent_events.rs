@@ -7,6 +7,61 @@ pub enum TranscriptKind {
     Pi,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePromptSubmissionState {
+    Prepared,
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NativePromptSubmissionReceipt {
+    pub submission_id: String,
+    pub terminal_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub state: NativePromptSubmissionState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventsOpenParams {
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventsReadParams {
+    pub stream_id: String,
+    #[serde(default = "start_cursor")]
+    pub after: String,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionEventStream {
+    pub stream_id: String,
+    pub terminal_id: String,
+    pub agent_kind: TranscriptKind,
+    pub session_id: String,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionEventsBatch {
+    pub stream_id: String,
+    pub events: Vec<AgentReplyEvent>,
+    pub next_cursor: String,
+    pub earliest_cursor: String,
+    pub latest_cursor: String,
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -95,6 +150,25 @@ pub struct AgentEventsSubmissionReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AgentEventsSubmissionReceiptResult {
+    Recovery(AgentEventsSubmissionReceipt),
+    Native(NativePromptSubmissionReceipt),
+}
+
+impl From<AgentEventsSubmissionReceipt> for AgentEventsSubmissionReceiptResult {
+    fn from(receipt: AgentEventsSubmissionReceipt) -> Self {
+        Self::Recovery(receipt)
+    }
+}
+
+impl From<NativePromptSubmissionReceipt> for AgentEventsSubmissionReceiptResult {
+    fn from(receipt: NativePromptSubmissionReceipt) -> Self {
+        Self::Native(receipt)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEventsRecoverTurnParams {
     pub agent_kind: TranscriptKind,
@@ -167,6 +241,9 @@ pub struct AgentEventsTurnList {
 fn default_limit() -> u32 {
     64
 }
+fn start_cursor() -> String {
+    "start".into()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentReplyEvent {
@@ -234,6 +311,24 @@ pub enum ReplyPayload {
     },
     BranchChanged {
         parent_id: Option<String>,
+    },
+    SubmissionReceipt {
+        submission_id: String,
+        state: NativePromptSubmissionState,
+    },
+    RuntimeStatusChanged {
+        pane_id: String,
+        status: super::AgentStatus,
+    },
+    RuntimeAgentChanged {
+        pane_id: String,
+        released: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_status: Option<super::AgentStatus>,
+    },
+    RuntimeEnded {
+        pane_id: String,
+        reason: String,
     },
     SourceError {
         code: String,

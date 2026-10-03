@@ -33,6 +33,9 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// Whether this server exposes the path-free, cursor-based session event stream.
+    #[serde(default)]
+    pub session_event_stream_v1: bool,
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,

@@ -76,6 +76,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        session_event_stream_v1: true,
         ssh_agent_registration: false,
         agent_session_rotation_v1: cfg!(unix),
         tab_create_v2: true,
@@ -124,7 +125,8 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
-    let reply_streams = agent_events::ReplyStreams::start(api_tx.clone(), running.clone());
+    let reply_streams =
+        agent_events::ReplyStreams::start(api_tx.clone(), event_hub.clone(), running.clone());
     let thread = std::thread::spawn(move || {
         run_accept_loop(
             listener.incoming(),
@@ -390,6 +392,41 @@ fn handle_connection_with_events(
                 &agent_events::failure(&request_id, "events_unavailable"),
             ),
         },
+        Method::SessionEventsSubscribe(params) => match reply_streams {
+            Some(service) => service.subscribe_session(stream, request_id, params, running),
+            None => write_json_line_allow_disconnect(
+                &mut stream,
+                &agent_events::failure(&request_id, "events_unavailable"),
+            ),
+        },
+        Method::SessionEventsOpen(_) | Method::SessionEventsRead(_) => {
+            let stream_id = match &request.method {
+                Method::SessionEventsRead(params) => Some(params.stream_id.clone()),
+                _ => None,
+            };
+            let result = match reply_streams {
+                Some(service) => match request.method {
+                    Method::SessionEventsOpen(params) => service
+                        .open_session(&params, api_tx)
+                        .map(|stream| ResponseResult::SessionEventsOpened { stream }),
+                    Method::SessionEventsRead(params) => service
+                        .read_session(&params)
+                        .map(|batch| ResponseResult::SessionEventsBatch { batch }),
+                    _ => unreachable!("session event method group is exhaustive"),
+                },
+                None => Err(crate::agent_events::EventError("events_unavailable")),
+            };
+            let response = match result {
+                Ok(result) => serde_json::json!({"id":request_id,"result":result}),
+                Err(error) => match (reply_streams, stream_id) {
+                    (Some(service), Some(stream_id)) => {
+                        service.read_failure(&request_id, error.0, &stream_id)
+                    }
+                    _ => agent_events::failure(&request_id, error.0),
+                },
+            };
+            write_json_line_allow_disconnect(&mut stream, &response)
+        }
         Method::AgentEventsAttach(_)
         | Method::AgentEventsSources(_)
         | Method::AgentEventsRead(_)
@@ -413,9 +450,13 @@ fn handle_connection_with_events(
                         .locate(&params)
                         .map(|boundary| ResponseResult::AgentEventsTurnCursor { boundary }),
                     Method::AgentEventsCapabilities(_) => Ok(service.capabilities()),
-                    Method::AgentEventsSubmission(params) => service
-                        .submission(&params)
-                        .map(|receipt| ResponseResult::AgentEventsSubmissionReceipt { receipt }),
+                    Method::AgentEventsSubmission(params) => {
+                        service.submission(&params).map(|receipt| {
+                            ResponseResult::AgentEventsSubmissionReceipt {
+                                receipt: receipt.into(),
+                            }
+                        })
+                    }
                     Method::AgentEventsRecoverTurn(params) => service
                         .recover_turn(&params)
                         .map(|batch| ResponseResult::AgentEventsRecoveryBatch { batch }),
@@ -516,7 +557,7 @@ fn handle_connection_with_events(
         }
         Method::AgentPrompt(params) => {
             let submission_id = params.submission_id.clone();
-            if submission_id.is_some() {
+            if let Some(submission_id) = submission_id.as_deref() {
                 let prepared = match reply_streams {
                     Some(service) => service.prepare_submission(&params, api_tx),
                     None => Err(crate::agent_events::EventError("events_unavailable")),
@@ -524,10 +565,25 @@ fn handle_connection_with_events(
                 match prepared {
                     Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
                     Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
-                        return write_json_line_allow_disconnect(
-                            &mut stream,
-                            &agent_events::failure(&request_id, "submission_duplicate"),
-                        );
+                        let result = reply_streams
+                            .ok_or(crate::agent_events::EventError("events_unavailable"))
+                            .and_then(|service| {
+                                service.native_submission(
+                                    &crate::api::schema::agent_events::AgentEventsSubmissionParams {
+                                        submission_id: submission_id.to_owned(),
+                                    },
+                                )
+                            });
+                        let response = match result {
+                            Ok(receipt) => serde_json::json!({
+                                "id": request_id,
+                                "result": ResponseResult::AgentEventsSubmissionReceipt {
+                                    receipt: receipt.into()
+                                }
+                            }),
+                            Err(error) => agent_events::failure(&request_id, error.0),
+                        };
+                        return write_json_line_allow_disconnect(&mut stream, &response);
                     }
                     Err(error) => {
                         return write_json_line_allow_disconnect(
@@ -537,37 +593,42 @@ fn handle_connection_with_events(
                     }
                 }
             }
-            let response = prompt_agent(
+            let prompt_result = match prompt_agent(
                 request_id.clone(),
                 params,
                 &mut stream,
                 api_tx,
                 event_hub,
                 running,
-            )?;
-            if let (Some(service), Some(submission_id), Some(response)) =
-                (reply_streams, submission_id.as_deref(), response.as_deref())
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let (Some(service), Some(submission_id)) =
+                        (reply_streams, submission_id.as_deref())
+                    {
+                        let _ = service.settle_submission(
+                            submission_id,
+                            crate::api::schema::agent_events::NativePromptSubmissionState::Uncertain,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let mut response = prompt_result.response;
+            if let (Some(service), Some(submission_id)) = (reply_streams, submission_id.as_deref())
             {
-                let code = serde_json::from_str::<serde_json::Value>(response)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .pointer("/error/code")
-                            .and_then(|code| code.as_str())
-                            .map(str::to_owned)
-                    });
-                if matches!(
-                    code.as_deref(),
-                    Some(
-                        "empty_agent_prompt"
-                            | "invalid_agent_prompt"
-                            | "agent_not_found"
-                            | "agent_not_ready"
-                            | "agent_blocked"
-                            | "agent_session_changed"
-                    )
-                ) {
-                    let _ = service.cancel_prepared_submission(submission_id);
+                let outcome =
+                    submission_outcome_for_response(prompt_result.submission_response.as_deref());
+                match service.settle_submission(submission_id, outcome) {
+                    Ok(receipt) if outcome == crate::api::schema::agent_events::NativePromptSubmissionState::Accepted => {
+                        attach_submission_receipt(&mut response, &receipt);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        response = Some(
+                            agent_events::failure(&request_id, error.0).to_string(),
+                        );
+                    }
                 }
             }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
@@ -592,20 +653,6 @@ fn handle_connection_with_events(
             else {
                 return write_text_line_allow_disconnect(&mut stream, &before);
             };
-            let begin_response = dispatch_to_app_with_timeout(
-                Request {
-                    id: request_id.clone(),
-                    method: Method::AgentPromptModel(params.clone()),
-                },
-                api_tx,
-                None,
-            );
-            if serde_json::from_str::<serde_json::Value>(&begin_response)
-                .ok()
-                .is_none_or(|value| value.get("error").is_some())
-            {
-                return write_text_line_allow_disconnect(&mut stream, &begin_response);
-            }
             let submission_params = crate::api::schema::AgentPromptParams {
                 target: params.target.clone(),
                 text: params.text.clone(),
@@ -620,10 +667,25 @@ fn handle_connection_with_events(
             match prepared {
                 Ok(crate::agent_events::SubmissionPrepareResult::Prepared) => {}
                 Ok(crate::agent_events::SubmissionPrepareResult::Duplicate) => {
-                    return write_json_line_allow_disconnect(
-                        &mut stream,
-                        &agent_events::failure(&request_id, "submission_duplicate"),
-                    );
+                    let result = reply_streams
+                        .ok_or(crate::agent_events::EventError("events_unavailable"))
+                        .and_then(|service| {
+                            service.native_submission(
+                                &crate::api::schema::agent_events::AgentEventsSubmissionParams {
+                                    submission_id: params.submission_id.clone(),
+                                },
+                            )
+                        });
+                    let response = match result {
+                        Ok(receipt) => serde_json::json!({
+                            "id": request_id,
+                            "result": ResponseResult::AgentEventsSubmissionReceipt {
+                                receipt: receipt.into()
+                            }
+                        }),
+                        Err(error) => agent_events::failure(&request_id, error.0),
+                    };
+                    return write_json_line_allow_disconnect(&mut stream, &response);
                 }
                 Err(error) => {
                     return write_json_line_allow_disconnect(
@@ -632,15 +694,62 @@ fn handle_connection_with_events(
                     );
                 }
             }
-            let response = prompt_agent_after_model_resume(
+            let begin_response = dispatch_to_app_with_timeout(
+                Request {
+                    id: request_id.clone(),
+                    method: Method::AgentPromptModel(params.clone()),
+                },
+                api_tx,
+                None,
+            );
+            if serde_json::from_str::<serde_json::Value>(&begin_response)
+                .ok()
+                .is_none_or(|value| value.get("error").is_some())
+            {
+                if let Some(service) = reply_streams {
+                    let _ = service.settle_submission(
+                        &params.submission_id,
+                        crate::api::schema::agent_events::NativePromptSubmissionState::Rejected,
+                    );
+                }
+                return write_text_line_allow_disconnect(&mut stream, &begin_response);
+            }
+            let prompt_result = match prompt_agent_after_model_resume(
                 request_id.clone(),
-                params,
+                params.clone(),
                 expected_terminal_id,
                 &mut stream,
                 api_tx,
                 event_hub,
                 running,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(service) = reply_streams {
+                        let _ = service.settle_submission(
+                            &params.submission_id,
+                            crate::api::schema::agent_events::NativePromptSubmissionState::Uncertain,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let mut response = prompt_result.response;
+            if let Some(service) = reply_streams {
+                let outcome =
+                    submission_outcome_for_response(prompt_result.submission_response.as_deref());
+                match service.settle_submission(&params.submission_id, outcome) {
+                    Ok(receipt) if outcome == crate::api::schema::agent_events::NativePromptSubmissionState::Accepted => {
+                        attach_submission_receipt(&mut response, &receipt);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        response = Some(
+                            agent_events::failure(&request_id, error.0).to_string(),
+                        );
+                    }
+                }
+            }
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         Method::AgentWait(params) => {
@@ -868,6 +977,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentEventsRecoverTurn(_) => "agent.events.recover_turn",
         Method::AgentEventsTurns(_) => "agent.events.turns",
         Method::AgentEventsSubscribe(_) => "agent.events.subscribe",
+        Method::SessionEventsOpen(_) => "session.events.open",
+        Method::SessionEventsRead(_) => "session.events.read",
+        Method::SessionEventsSubscribe(_) => "session.events.subscribe",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
@@ -1316,6 +1428,78 @@ fn caller_timeout_dispatch_uses_timeout_error() {
     assert_eq!(error.error.code, "timeout");
 }
 
+#[cfg(test)]
+#[test]
+fn submission_outcome_uses_only_the_pty_receipt_boundary() {
+    use crate::api::schema::agent_events::NativePromptSubmissionState;
+
+    assert_eq!(
+        submission_outcome_for_response(Some(r#"{"id":"p","result":{"type":"agent_prompted"}}"#)),
+        NativePromptSubmissionState::Accepted
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_not_ready","message":"not ready"}}"#
+        )),
+        NativePromptSubmissionState::Rejected
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_prompt_not_submitted","message":"closed"}}"#
+        )),
+        NativePromptSubmissionState::Rejected
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"agent_prompt_failed","message":"write failed"}}"#
+        )),
+        NativePromptSubmissionState::Uncertain
+    );
+    assert_eq!(
+        submission_outcome_for_response(Some(
+            r#"{"id":"p","error":{"code":"timeout","message":"completion unknown"}}"#
+        )),
+        NativePromptSubmissionState::Uncertain
+    );
+    assert_eq!(
+        submission_outcome_for_response(None),
+        NativePromptSubmissionState::Uncertain
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_receipt_is_embedded_in_the_prompt_response() {
+    use crate::api::schema::agent_events::{
+        NativePromptSubmissionReceipt, NativePromptSubmissionState, TranscriptKind,
+    };
+
+    let mut response =
+        Some(r#"{"id":"p","result":{"type":"agent_prompted","submission_id":"prompt-1"}}"#.into());
+    attach_submission_receipt(
+        &mut response,
+        &NativePromptSubmissionReceipt {
+            submission_id: "prompt-1".into(),
+            terminal_id: "terminal-1".into(),
+            agent_kind: TranscriptKind::Traex,
+            session_id: "session-1".into(),
+            state: NativePromptSubmissionState::Accepted,
+            created_at: 10,
+            updated_at: 11,
+        },
+    );
+
+    let value: serde_json::Value = serde_json::from_str(response.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        value.pointer("/result/submission_receipt/state"),
+        Some(&serde_json::json!("accepted"))
+    );
+    assert_eq!(
+        value.pointer("/result/submission_receipt/submission_id"),
+        Some(&serde_json::json!("prompt-1"))
+    );
+}
+
 fn error_response_json(id: String, code: &str, message: String) -> String {
     serde_json::to_string(&ErrorResponse {
         id,
@@ -1328,6 +1512,64 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
         r#"{"id":"","error":{"code":"internal_error","message":"failed to encode error response"}}"#
             .to_string()
     })
+}
+
+fn submission_outcome_for_response(
+    response: Option<&str>,
+) -> crate::api::schema::agent_events::NativePromptSubmissionState {
+    use crate::api::schema::agent_events::NativePromptSubmissionState;
+
+    let Some(value) = response.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return NativePromptSubmissionState::Uncertain;
+    };
+    if value
+        .pointer("/result/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_prompted")
+    {
+        return NativePromptSubmissionState::Accepted;
+    }
+    match value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(
+            "empty_agent_prompt"
+            | "invalid_agent_prompt"
+            | "agent_not_found"
+            | "agent_not_ready"
+            | "agent_blocked"
+            | "agent_session_changed"
+            | "agent_prompt_not_submitted"
+            | "agent_model_resume_timeout"
+            | "agent_not_running",
+        ) => NativePromptSubmissionState::Rejected,
+        _ => NativePromptSubmissionState::Uncertain,
+    }
+}
+
+fn attach_submission_receipt(
+    response: &mut Option<String>,
+    receipt: &crate::api::schema::agent_events::NativePromptSubmissionReceipt,
+) {
+    let Some(raw) = response.as_deref() else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(result) = value
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    result.insert(
+        "submission_receipt".into(),
+        serde_json::to_value(receipt).expect("submission receipt serializes"),
+    );
+    *response = Some(value.to_string());
 }
 
 #[cfg(all(test, unix))]
@@ -1664,6 +1906,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                session_event_stream_v1: true,
                 ssh_agent_registration: false,
                 agent_session_rotation_v1: true,
                 tab_create_v2: true,
@@ -1676,6 +1919,15 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn default_capabilities_advertise_the_session_event_stream() {
+        assert!(
+            default_capabilities()
+                .expect("default server capabilities")
+                .session_event_stream_v1
+        );
     }
 
     #[test]

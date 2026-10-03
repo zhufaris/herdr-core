@@ -16,7 +16,7 @@ use std::path::Path;
 const MAX_SOURCES: i64 = 256;
 const RETENTION_SECONDS: i64 = 7 * 24 * 3600;
 const MAX_EVENT_BYTES: i64 = 192 * 1024 * 1024;
-const JOURNAL_VERSION: i64 = 2;
+const JOURNAL_VERSION: i64 = 4;
 const HISTORY_INDEX_BATCHES_PER_LOOKUP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +114,18 @@ impl Journal {
                 .iter()
                 .any(|column| column == name)
         };
+        let has_rich_submission_schema = [
+            "transcript_id",
+            "turn_id",
+            "turn_started_at",
+            "human_event_key",
+            "terminal_state",
+            "updated",
+        ]
+        .into_iter()
+        .all(has_pending_submission_column);
+        let has_stream_submission_schema = has_pending_submission_column("correlated")
+            && !has_pending_submission_column("transcript_id");
         if version == 0 {
             db.execute_batch("CREATE TABLE pending_submissions (
                 submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
@@ -129,7 +141,7 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=2;")?;
+                PRAGMA user_version=4;")?;
         } else if version == 1 {
             db.execute_batch("BEGIN IMMEDIATE;
                 DROP INDEX IF EXISTS pending_submissions_match;
@@ -153,16 +165,15 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
-                PRAGMA user_version=2;
+                PRAGMA user_version=4;
                 COMMIT;")?;
-        } else if has_pending_submission_column("correlated")
-            && !has_pending_submission_column("transcript_id")
-        {
-            // The stream-only v2 converted any prepared receipt to uncertain on reopen,
+        } else if matches!(version, 2 | 3) && has_stream_submission_schema {
+            // The stream-only v2/v3 journal converted any prepared receipt to uncertain
+            // on reopen,
             // so none of its states prove that a prompt is safe to submit again.
             db.execute_batch("BEGIN IMMEDIATE;
                 DROP INDEX IF EXISTS pending_submissions_match;
-                ALTER TABLE pending_submissions RENAME TO pending_submissions_stream_v2;
+                ALTER TABLE pending_submissions RENAME TO pending_submissions_stream_legacy;
                 CREATE TABLE pending_submissions (
                   submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, agent_kind TEXT NOT NULL,
                   session_id TEXT NOT NULL, text_digest TEXT NOT NULL,
@@ -172,8 +183,8 @@ impl Journal {
                 INSERT INTO pending_submissions(submission_id,terminal_id,agent_kind,session_id,text_digest,state,created,updated)
                   SELECT submission_id,terminal_id,agent_kind,session_id,text_digest,
                     'legacy_unavailable',created,updated
-                  FROM pending_submissions_stream_v2;
-                DROP TABLE pending_submissions_stream_v2;
+                  FROM pending_submissions_stream_legacy;
+                DROP TABLE pending_submissions_stream_legacy;
                 CREATE INDEX pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
                 CREATE TABLE IF NOT EXISTS turn_index (
                   transcript_id TEXT NOT NULL, agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -182,23 +193,14 @@ impl Journal {
                   human_event_key TEXT, human_text_digest TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                   PRIMARY KEY(transcript_id,turn_id,started_at));
                 CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
+                PRAGMA user_version=4;
                 COMMIT;")?;
-        } else {
-            if ![
-                "transcript_id",
-                "turn_id",
-                "turn_started_at",
-                "human_event_key",
-                "terminal_state",
-                "updated",
-            ]
-            .into_iter()
-            .all(has_pending_submission_column)
-            {
-                return Err(EventError("journal_unavailable"));
-            }
+        } else if matches!(version, 2..=4) && has_rich_submission_schema {
             db.execute_batch("CREATE INDEX IF NOT EXISTS pending_submissions_match ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,created);
-                CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);")?;
+                CREATE INDEX IF NOT EXISTS turn_index_session_order ON turn_index(agent_kind,session_id,started_at,turn_id);
+                PRAGMA user_version=4;")?;
+        } else {
+            return Err(EventError("unsupported_journal_schema"));
         }
         let id = db.query_row("SELECT value FROM metadata WHERE key='id'", [], |r| {
             r.get(0)
@@ -1552,6 +1554,11 @@ mod tests {
             file_identity: "file".into(),
         };
         let mut journal = Journal::open(&path).unwrap();
+        let created_version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(created_version, 4);
         let before = journal.attach(&source, &Checkpoint::default()).unwrap();
         assert_eq!(
             journal
@@ -1619,8 +1626,14 @@ mod tests {
         assert_eq!(receipt.state, AgentEventsSubmissionState::Observed);
         assert_eq!(receipt.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(receipt.started_at.as_deref(), Some("2026-09-28T00:00:00Z"));
+        journal.db.execute_batch("PRAGMA user_version=2;").unwrap();
         drop(journal);
         let mut reopened = Journal::open(&path).unwrap();
+        let migrated_version: i64 = reopened
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(migrated_version, 4);
         assert_eq!(
             reopened
                 .prepare_submission(
@@ -1670,6 +1683,11 @@ mod tests {
         assert_eq!(receipt.state, AgentEventsSubmissionState::LegacyUnavailable);
         assert!(receipt.turn_id.is_none());
         assert!(receipt.started_at.is_none());
+        let version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
         drop(journal);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -1719,6 +1737,11 @@ mod tests {
         assert!(columns.contains(&"human_event_key".to_owned()));
         assert!(columns.contains(&"terminal_state".to_owned()));
         assert!(!columns.contains(&"correlated".to_owned()));
+        let version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
 
         for submission_id in ["prepared", "accepted", "rejected", "uncertain"] {
             let receipt = journal
@@ -1766,6 +1789,117 @@ mod tests {
             AgentEventsSubmissionState::LegacyUnavailable
         );
         drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deployed_version_three_migrates_without_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-deployed-v3-migration-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE pending_submissions (
+                    submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                    text_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('prepared','accepted','rejected','uncertain')),
+                    correlated INTEGER NOT NULL DEFAULT 0 CHECK(correlated IN (0,1)),
+                    created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                 CREATE INDEX pending_submissions_match
+                    ON pending_submissions(terminal_id,agent_kind,session_id,text_digest,state,correlated,created);
+                 INSERT INTO pending_submissions VALUES
+                    ('prepared','term','traex','session','digest-1','prepared',0,1,2),
+                    ('accepted','term','traex','session','digest-2','accepted',1,3,4),
+                    ('rejected','term','traex','session','digest-3','rejected',0,5,6),
+                    ('uncertain','term','traex','session','digest-4','uncertain',0,7,8);
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        }
+
+        let mut journal = Journal::open(&path).unwrap();
+        for submission_id in ["prepared", "accepted", "rejected", "uncertain"] {
+            let receipt = journal
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: submission_id.into(),
+                })
+                .unwrap();
+            assert_eq!(receipt.state, AgentEventsSubmissionState::LegacyUnavailable);
+            assert!(receipt.turn_id.is_none());
+            assert!(receipt.started_at.is_none());
+            assert!(receipt.terminal_state.is_none());
+        }
+        assert_eq!(
+            journal
+                .prepare_submission(
+                    "accepted",
+                    "term",
+                    TranscriptKind::Traex,
+                    "session",
+                    "different text"
+                )
+                .unwrap_err()
+                .0,
+            "submission_identity_conflict"
+        );
+        let version: i64 = journal
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        drop(journal);
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .submission(&AgentEventsSubmissionParams {
+                    submission_id: "accepted".into(),
+                })
+                .unwrap()
+                .state,
+            AgentEventsSubmissionState::LegacyUnavailable
+        );
+        drop(reopened);
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn current_version_rejects_a_legacy_stream_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-journal-v4-legacy-schema-{}-{}.db",
+            std::process::id(),
+            now()
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE pending_submissions (
+                    submission_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                    text_digest TEXT NOT NULL, state TEXT NOT NULL,
+                    correlated INTEGER NOT NULL DEFAULT 0,
+                    created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                 PRAGMA user_version=4;",
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            Journal::open(&path),
+            Err(EventError("unsupported_journal_schema"))
+        ));
+        let db = Connection::open(&path).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        drop(db);
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }
